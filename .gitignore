@@ -1,0 +1,30 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Environment Variables (API KEYS - DO NOT COMMIT!)
+.env
+.env.*
+
+# Databases, Vector Stores & Caches
+qdrant_data/
+.cache/
+*.sqlite3
+*.db
+
+# Project-Specific Data & Generated Files
+src/scraper/data/
+src/eval/reports/
+
+# Tooling / AI artifacts
+.claude/
+
+# IDEs & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

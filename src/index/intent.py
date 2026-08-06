@@ -1,0 +1,59 @@
+"""
+intent.py  --  which section of a service is the question about?
+================================================================
+Shared by the retrieval layer (structured section fetch) and the agent
+(variation-ambiguity detection), so both agree on what a question is asking for.
+
+Cues are matched with a LEFT word boundary only, so a prefix still catches
+Macedonian inflection (рок / рокот / рокови) while "чин" cannot fire inside
+"начин" -- a real bug the selftest caught.
+
+An empty result means "unclear", and every caller treats that as a reason to do
+nothing rather than to guess: injecting the wrong section into a legal answer is
+worse than injecting none.
+"""
+from __future__ import annotations
+
+import re
+import unicodedata
+
+INTENT_CUES: dict[str, tuple[str, ...]] = {
+    "documentsLocations": ("подигн", "преземањ", "презем", "подига"),
+    "forms": ("образец", "обрасц", "формулар"),
+    "tariffs": ("чин", "цена", "цени", "тариф", "надомест", "кошта", "плати",
+                "чинат", "пари"),
+    "deadlines": ("рок", "колку време", "трае", "траење"),
+    "documents": ("документ", "потребн", "прилож", "доказ", "поднесам",
+                  "што треба", "поднесе"),
+    "access": ("онлајн", "интернет", "електронск", "плаќањ", "шалтер"),
+    # "пријав" is deliberately absent: it is a NOUN in dozens of service names
+    # ("Самостојна пријава за упис на основање"), so it fired on questions that
+    # merely named a service and injected its procedure over the description.
+    "process": ("како", "постапк", "чекор", "начин", "кога", "каде"),
+}
+
+# Dict order above IS the precedence, most specific first. Questions routinely
+# trip several cues at once -- "Каде и како го подигнувам документот за X?" hits
+# documents ("документ"), process ("како") and access ("каде") -- and injecting
+# all three floods the answer with the wrong sections. The vague interrogatives
+# (како / каде / кога) sit last on purpose: they appear in almost every
+# question and are the weakest evidence of what is actually being asked.
+
+
+
+def _norm(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).casefold()
+
+
+def detect_intent(query: str, *, top_only: bool = False) -> list[str]:
+    """Section type(s) the question is about; empty when unclear.
+
+    `top_only` keeps just the most specific match -- what structured fetch uses,
+    so a question cannot pull in three sections at once. Ambiguity detection
+    wants the full list: any section that differs between legal forms is a
+    reason to ask.
+    """
+    q = _norm(query)
+    found = [type_ for type_, cues in INTENT_CUES.items()
+             if any(re.search(rf"(?<!\w){re.escape(cue)}", q) for cue in cues)]
+    return found[:1] if top_only else found
