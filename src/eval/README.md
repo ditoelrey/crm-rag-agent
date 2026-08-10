@@ -103,6 +103,45 @@ Two findings the index has to answer for:
    (variation_process −0.044, variation_deadlines −0.041); MK definite-article
    suffixes are not optional for this corpus.
 
+## Answer eval
+
+Retrieval scoring stops at the context window. `answers.py` scores what the
+model *says* — every answer-quality defect in this project was found by a human
+reading output, and none of them moved a retrieval metric.
+
+```bash
+python -m eval.cli answer --tag baseline            # generate + score (curated set)
+python -m eval.cli answer --from eval/answers/baseline.jsonl --tag rescored
+python -m eval.cli answer --tag candidate --baseline eval/reports/baseline.json
+```
+
+Generation and scoring are **separate steps**. Answers are written to
+`eval/answers/<tag>.jsonl`; `--from` re-scores them without calling the model,
+so iterating on a scorer is free and a run can be re-graded after the rules
+change.
+
+| metric | what it catches |
+|---|---|
+| `behavior_match` | answer / clarify / abstain — an agent that always answers scores well everywhere else while being unsafe |
+| `value_recall` | the checkable facts (295 МКД, 15 дена, 4 часа), verified against the corpus when the case was written |
+| `no_forbidden` | the near-miss value must not appear — 299 МКД is a real tariff for a *different* certificate |
+| `numeric_groundedness` | every multi-digit number in the answer appears in the retrieved context |
+| `value_citation` | a cited block actually *contains* the fact — catches "cited part 1 for a fact in part 2" |
+| `citation_integrity` | no fabricated ids |
+
+The default gate is fully deterministic and costs nothing beyond generation. A
+fee is right or it isn't; an LLM judge adds noise where exact matching is
+available. `--judge` adds a model-scored groundedness pass for prose claims that
+carry no number — opt-in, because it cannot be a stable regression gate.
+
+Runs on the **curated set by default** (26 cases, ~$0.05): answer eval costs
+money per case, and curated is the honest quality signal anyway.
+
+Three `expect_behavior="abstain"` cases carry no retrieval gold on purpose —
+each topic was verified to have **zero** matching corpus blocks. A gold set made
+only of answerable questions rewards a system that always answers. Retrieval
+runs skip them automatically.
+
 ## Regression gate
 
 `run --baseline <report.json>` exits 1 on a drop beyond `--tolerance` (default

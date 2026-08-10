@@ -144,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("-k", type=int, default=DEFAULT_K, help="documents retrieved")
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    p.add_argument("--timeout", type=float, default=120.0,
+                   help="per-request timeout in seconds")
     p.add_argument("--no-dedup", action="store_true",
                    help="keep byte-identical duplicate blocks in the context")
     p.add_argument("--no-aliases", action="store_true",
@@ -159,7 +161,8 @@ def main(argv: list[str] | None = None) -> int:
         agent = CRMAgent(corpus=corpus, model=args.model, k=args.k,
                          temperature=args.temperature, dedup=not args.no_dedup,
                          aliases=not args.no_aliases,
-                         structured=not args.no_structured)
+                         structured=not args.no_structured,
+                         timeout=args.timeout)
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         return 2

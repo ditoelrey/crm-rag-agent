@@ -17,6 +17,7 @@ Run: python -m eval.cli selftest        (from src/)
 from __future__ import annotations
 
 import math
+import os
 import traceback
 
 from . import curated, goldset, metrics as M
@@ -157,13 +158,192 @@ def _end_to_end_tests(c) -> None:
     check_true("report carries the corpus hash", len(bm25.corpus_sha256) == 64)
 
 
+def _answer_tests(c) -> None:
+    """Every scorer is checked against a defect this project actually produced.
+
+    A scorer that cannot catch the failures we already know about is decoration.
+    """
+    print("[answer eval]")
+    from . import answers as A
+    from . import curated
+
+    cases = {x.query: x for x in curated.expand(c)}
+
+    def rec(text, cites=(), docs=(), clarify=False, invalid=()):
+        return A.AnswerRecord(case_id="t", query="q", text=text,
+                              citations=list(cites), docs=list(docs or cites),
+                              asked_clarification=clarify,
+                              invalid_citations=list(invalid))
+
+    fee_case = cases["Колку чини потврда за тековна состојба на фирма?"]
+    tariff = "srv_2162_v11050_tariffs_1"
+
+    good = rec("Тарифата изнесува 295 МКД [%s]." % tariff, [tariff])
+    check("correct fee: value found", A.value_recall(good, fee_case), 1.0)
+    check("correct fee: near-miss absent", A.forbidden_absent(good, fee_case), 1.0)
+    check("correct fee: numbers grounded", A.numeric_groundedness(good, c), 1.0)
+    check("correct fee: the citation supports it",
+          A.value_citation(good, fee_case, c), 1.0)
+
+    # 299 МКД is a REAL tariff -- for a different certificate. The most
+    # expensive class of error this system can make.
+    wrong = rec("Тарифата изнесува 299 МКД [srv_2185_v10943_tariffs_1].",
+                ["srv_2185_v10943_tariffs_1"])
+    check("near-miss fee is caught", A.forbidden_absent(wrong, fee_case), 0.0)
+    check("...and the expected value is missing", A.value_recall(wrong, fee_case), 0.0)
+
+    invented = rec("Тарифата изнесува 999 МКД [%s]." % tariff, [tariff])
+    check("a fabricated amount is ungrounded",
+          A.numeric_groundedness(invented, c), 0.0)
+
+    # Observed live: correct details, cited to part 1 of a list; the agent named
+    # is in part 2. Retrieval-level checking cannot see this.
+    both = ["agents_doo_tp_centar_p1", "agents_doo_tp_centar_p2"]
+    misattributed = rec("Телефонот е 077-860-715 [agents_doo_tp_centar_p1].",
+                        ["agents_doo_tp_centar_p1"], both)
+    phone_case = A_case(cases, "Кои се овластените регистрациони агенти во Гостивар?",
+                        ["077-860-715"])
+    check("citation to the wrong part is caught",
+          A.value_citation(misattributed, phone_case, c), 0.0)
+    check("...while the fact itself is grounded in the context",
+          A.numeric_groundedness(misattributed, c), 1.0)
+    right = rec("Телефонот е 077-860-715 [agents_doo_tp_centar_p2].",
+                ["agents_doo_tp_centar_p2"], both)
+    check("citation to the right part passes",
+          A.value_citation(right, phone_case, c), 1.0)
+
+    # Behaviour classification.
+    check("abstention is recognised",
+          A.observed_behavior(rec("Во документацијата со која располагам нема "
+                                  "информација за тоа.")), "abstain")
+    check("clarification is recognised",
+          A.observed_behavior(rec("За каква правна форма станува збор?")), "clarify")
+    check("the ambiguity flag alone marks a clarification",
+          A.observed_behavior(rec("Која е вашата намера?", clarify=True)), "clarify")
+    check("a normal answer is an answer",
+          A.observed_behavior(rec("Тарифата изнесува 295 МКД [x].")), "answer")
+
+    # An answer that states a fee and notes one gap is an ANSWER, not a refusal
+    # -- grading it as one would reward hedging.
+    hedged = rec("Тарифата изнесува 295 МКД [%s]. " % tariff
+                 + "Дополнителни детали за роковите не се достапни во "
+                 + "документацијата со која располагам, па препорачувам да "
+                 + "проверите директно кај Централниот регистар за останатите "
+                 + "чекори од постапката и потребните документи." )
+    check("a hedged answer is still an answer", A.observed_behavior(hedged), "answer")
+
+    # Enumeration markers must not be read as factual numbers.
+    check("list markers are not claims",
+          A.numbers_in("1. Прв чекор\n2. Втор чекор\n3. Трет чекор"), [])
+    check("real numbers are claims",
+          A.numbers_in("Тарифата е 2452 МКД, рокот е 15 дена."), ["2452", "15"])
+
+    check("a fabricated citation fails integrity",
+          A.score_case(rec("Текст [srv_9999_v0_x_1].", invalid=["srv_9999_v0_x_1"]),
+                       fee_case, c)[0]["citation_integrity"], 0.0)
+
+    # Behaviour gold: an abstain case answered is a behaviour miss.
+    abstain_case = cases["Како да извадам возачка дозвола?"]
+    scores, _ = A.score_case(rec("Возачка дозвола се вади во МВР."), abstain_case, c)
+    check("answering an out-of-scope question fails behaviour",
+          scores["behavior_match"], 0.0)
+    scores, _ = A.score_case(
+        rec("Во документацијата со која располагам нема информација за тоа."),
+        abstain_case, c)
+    check("declining an out-of-scope question passes behaviour",
+          scores["behavior_match"], 1.0)
+
+    # A correct paraphrase must not be graded as a miss. The corpus writes
+    # "15.3."; gpt-4o wrote "15 март" and an earlier scorer gave it 0.0 on both
+    # value_recall and numeric_groundedness -- rewarding regurgitation.
+    dl = cases["Кои се роковите за поднесување годишна сметка за банка?"]
+    verbatim = rec("Роковите се 15.3. и 31.12. [srv_2111_v11176_deadlines_1].",
+                   ["srv_2111_v11176_deadlines_1"],
+                   ["srv_2111_v11176_deadlines_1", "srv_2111_v11176_deadlines_2"])
+    natural = rec("Роковите се до 15 март и до 31 декември "
+                  "[srv_2111_v11176_deadlines_1].",
+                  ["srv_2111_v11176_deadlines_1"],
+                  ["srv_2111_v11176_deadlines_1", "srv_2111_v11176_deadlines_2"])
+    check("verbatim dates score full marks", A.value_recall(verbatim, dl), 1.0)
+    check("a natural rendering scores the same", A.value_recall(natural, dl), 1.0)
+    check("...and is not read as ungrounded",
+          A.numeric_groundedness(natural, c), 1.0)
+    invented_date = rec("Рокот е до 27 март [srv_2111_v11176_deadlines_1].",
+                        ["srv_2111_v11176_deadlines_1"],
+                        ["srv_2111_v11176_deadlines_1"])
+    check("but an invented date is still caught",
+          A.numeric_groundedness(invented_date, c), 0.0)
+
+    # --- conversations ---------------------------------------------------- #
+    mt = cases["Кои се овластените регистрациони агенти во Гостивар?"]
+    check("the fabrication case is multi-turn", len(mt.conversation), 3)
+    check_true("its assertions target the FINAL answer",
+               "струмица" in mt.expect_values and "борче јованоски" in mt.forbid_values)
+
+    # The exact leak seen live: a Гостивар street in an answer about Струмица.
+    leaked = A.AnswerRecord(
+        case_id=mt.case_id, query=mt.query,
+        text="Еве неколку агенти: АДВОКАТ ТОМЕ ЃОРЃЕВИЌ, Ул. БОРЧЕ ЈОВАНОСКИ "
+             "Бр.56 ГОСТИВАР.",
+        turns=[{"text": "...", "citations": ["agents_doo_tp_gostivar_p1"]},
+               {"text": "...", "citations": ["agents_advocates_strumica_p1"]},
+               {"text": "Еве неколку...", "citations": []}])
+    check("the history leak is caught", A.forbidden_absent(leaked, mt), 0.0)
+
+    clean = A.AnswerRecord(
+        case_id=mt.case_id, query=mt.query,
+        text="Во Струмица се достапни следниве агенти "
+             "[agents_advocates_strumica_p1].",
+        citations=["agents_advocates_strumica_p1"],
+        turns=[{"text": "a", "citations": ["agents_doo_tp_gostivar_p1"]},
+               {"text": "b", "citations": ["agents_advocates_strumica_p1"]},
+               {"text": "c", "citations": ["agents_advocates_strumica_p1"]}])
+    check("a clean conversation passes", A.forbidden_absent(clean, mt), 1.0)
+    check("...and states the right municipality", A.value_recall(clean, mt), 1.0)
+
+    # Per-turn behaviour: ending well does not excuse asking the wrong thing.
+    cl = cases["Колку чини регистрација?"]
+    good = A.AnswerRecord(
+        case_id=cl.case_id, query=cl.query, text="Тарифата е 0 МКД [x].",
+        citations=["srv_2135_v11113_tariffs_1"],
+        turns=[{"text": "За каква правна форма станува збор?", "citations": [],
+                "asked_clarification": True},
+               {"text": "Тарифата е 0 МКД.", "citations": ["srv_2135_v11113_tariffs_1"]}])
+    check("a correct round trip scores 1.0",
+          A.score_case(good, cl, c)[0]["turn_behavior_match"], 1.0)
+    guessed = A.AnswerRecord(
+        case_id=cl.case_id, query=cl.query, text="Тарифата е 2452 МКД [x].",
+        citations=["srv_2135_v11117_tariffs_1"],
+        turns=[{"text": "Тарифата е 2452 МКД.", "citations": ["srv_2135_v11117_tariffs_1"]},
+               {"text": "Тарифата е 2452 МКД.", "citations": ["srv_2135_v11117_tariffs_1"]}])
+    check("answering instead of asking fails the round trip",
+          A.score_case(guessed, cl, c)[0]["turn_behavior_match"], 0.5)
+    check("...and quoting the wrong form's fee is caught",
+          A.forbidden_absent(guessed, cl), 0.0)
+
+    # Round trip through disk, so `--from` re-scoring is safe.
+    import tempfile
+    tmp = os.path.join(tempfile.mkdtemp(), "a.jsonl")
+    A.write_answers([good], tmp)
+    check("answers survive a save/load round trip",
+          A.read_answers(tmp)[0].text, good.text)
+
+
+def A_case(cases, query, values):
+    """A copy of a curated case with different expected values, for fixtures."""
+    import copy
+    case = copy.deepcopy(cases[query])
+    case.expect_values = list(values)
+    return case
+
+
 def main(corpus_path: str = DEFAULT_CORPUS) -> int:
     _failures.clear()
     c = load_corpus(corpus_path)
     print(f"corpus: {c.path}\n        {len(c)} blocks, sha={c.sha256[:12]}\n")
     for stage in (_metrics_tests, _text_tests):
         stage()
-    for stage in (_goldset_tests, _end_to_end_tests):
+    for stage in (_goldset_tests, _answer_tests, _end_to_end_tests):
         try:
             stage(c)
         except Exception:

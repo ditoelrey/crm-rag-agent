@@ -256,6 +256,34 @@ Latin `M` (U+004D)** instead of Cyrillic `М` (U+041C). Left alone, that homogly
 would have split one municipality into two buckets and a lookup would have
 quietly returned half the agents.
 
+### Answer evaluation
+
+Retrieval scoring stops at the context window. A second harness scores what the
+model *says*, reusing the same report format and regression gate:
+
+| metric | catches |
+|---|---|
+| `behavior_match` | answer / clarify / abstain — an agent that always answers scores well everywhere else while being unsafe |
+| `value_recall` | checkable facts (295 МКД, 15 дена, 4 часа), verified against the corpus when the case was written |
+| `no_forbidden` | the near-miss must not appear — 299 МКД is a real tariff for a *different* certificate |
+| `numeric_groundedness` | every multi-digit number in the answer appears in the retrieved context |
+| `value_citation` | a cited block actually *contains* the fact — catches "cited part 1 for a fact in part 2" |
+| `citation_integrity` | no fabricated ids |
+
+Deterministic by default: a fee is right or it is not, and exact matching is
+reproducible where an LLM judge is not (`--judge` adds an opt-in groundedness
+pass for prose claims carrying no number). Generation and scoring are separate
+steps — answers are persisted, so re-scoring after a rule change costs nothing.
+
+Current: **0.994** over 27 curated cases, ~$0.02 per full run. The single
+residual failure is a glossary definition covering two registers where the
+answer states one.
+
+Its first four runs found seven defects — in the gold, the scorers, and the
+retrieval layer — and one in the model. That ratio is the honest state of a new
+instrument: the gold set, not the model, is the binding constraint on what can
+be learned.
+
 ### Strict citation verification
 
 Every factual claim carries the exact `chunk_id` in brackets. After generation,
@@ -446,27 +474,18 @@ of a submitted application, and current tariff schedules. The retrieval tool
 already has the right shape — `search(query, k, filters)` — so tools slot into
 the same contract rather than requiring a new orchestration model.
 
-### 🚧 Answer-evaluation layer — *in development*
+### 🚧 Multi-turn and adversarial evaluation — *next*
 
-The retrieval harness scores what reaches the context window. It cannot score
-what the model does with it — and every answer-quality defect found so far was
-found by reading output by hand. The answer layer reuses the existing runner,
-report format and regression gate, adding four scorers:
+The answer harness scores single questions. Three paths remain unmeasured, each
+one a place this system has already been bitten or could be:
 
-- **Exact-value correctness** — the curated cases carry checkable facts
-  (295 МКД, 2,452 МКД, 15 дена, 4 часа). Exact matching beats an LLM judge for
-  this class of question.
-- **Groundedness** — every claim traceable to a retrieved block.
-- **Citation validity** — not merely that a cited ID *was retrieved*, but that it
-  *supports the claim*. A live answer cited part 1 of a list for a fact that
-  lives in part 2; the current validator cannot see that.
-- **Behavioural match** — `answer` vs `clarify` vs `abstain`, already carried on
-  every curated case as `expect_behavior` and not yet read by anything.
-
-Requires extending the gold set with out-of-scope questions, so abstention can be
-scored rather than assumed.
-
----
+- **Multi-turn.** The worst defect this project produced — a lawyer assembled
+  from a Струмица name and a Гостивар address — was a *conversation* failure,
+  and is currently untestable: every case is one question.
+- **Partial-coverage answers.** The `<coverage>` warning has no case that
+  triggers it.
+- **Prompt injection through corpus text.** Blocks are portal-authored and get
+  rendered into a system message.
 
 ## Tech stack
 
@@ -491,10 +510,8 @@ dependencies** — they run anywhere Python does, with no API key.
 Stated plainly, because a system that documents its edges is easier to trust than
 one that claims none.
 
-- **Answer quality is not yet automatically measured.** Retrieval is; generation
-  is not. This is the top roadmap item.
-- **Citation granularity.** Verification confirms a cited block was retrieved,
-  not that it contains the specific claim.
+- **Answer quality is measured on 27 curated cases only.** Broad, but shallow:
+  see the roadmap for the paths still untested.
 - **`gpt-4o-mini` citation discipline** is imperfect — it tends to batch
   citations at the end of a passage rather than per claim. `--model gpt-4o` is a
   one-flag swap.

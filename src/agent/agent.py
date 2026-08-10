@@ -37,6 +37,11 @@ from .prompts import SYSTEM_PROMPT, context_message
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_K = 10
 DEFAULT_TEMPERATURE = 0.0
+# The OpenAI SDK defaults to a 600-second timeout; combined with retries a single
+# stuck request can block a batch run for over half an hour. Observed: an answer
+# eval hung for ten minutes on one case with no way to tell it apart from slow
+# generation. Long list answers here take ~20s at p95, so 120s is generous.
+DEFAULT_TIMEOUT = 120.0
 MAX_HISTORY_TURNS = 4
 # How much of a past answer survives into the next turn's history.
 #
@@ -62,6 +67,20 @@ OVERFETCH = 4
 _DISCOURSE_OPENERS = frozenset("а ама и ок добро значи па аха".split())
 _ANAPHORS = frozenset("тоа тој таа тие ова овој оваа овие истото истата истиот "
                       "него неа нив таму тогаш".split())
+
+# Requests for MORE of what was just discussed. They carry no subject of their
+# own, so they are follow-ups however long they are.
+#
+# Observed: "Дај ми неколку како пример" is five tokens with no discourse opener
+# and no anaphor, so it was treated as a new question, retrieved on the bare
+# phrase and found nothing -- and the agent then said it had no information
+# about Струмица agents, one turn after listing forty-five of them. Safer than
+# the fabrication it replaced, still a contradiction.
+#
+# Deliberately phrases, not bare verbs: "Дај ми го ЗП образецот" opens the same
+# way but names its own subject and must stay self-contained.
+_CONTINUATION = ("како пример", "за пример", "уште", "неколку", "повеќе",
+                 "друг пример", "останати", "сите други", "на пример")
 
 # USD per 1M tokens, as configured -- update if OpenAI's pricing changes.
 PRICING = {
@@ -117,9 +136,11 @@ def is_followup(message: str) -> bool:
     toks = tokenize(message, do_stem=False, drop_stopwords=False)
     if not toks:
         return False
+    lowered = message.casefold()
     return (len(toks) <= 3
             or toks[0] in _DISCOURSE_OPENERS
-            or any(t in _ANAPHORS for t in toks))
+            or any(t in _ANAPHORS for t in toks)
+            or any(phrase in lowered for phrase in _CONTINUATION))
 
 
 def match_variation(reply: str, candidates: Sequence[tuple[int, str]],
@@ -156,8 +177,8 @@ class CRMAgent:
                  model: str = DEFAULT_MODEL, k: int = DEFAULT_K,
                  temperature: float = DEFAULT_TEMPERATURE,
                  dedup: bool = True, aliases: bool = True,
-                 structured: bool = True, api_key: str | None = None,
-                 client=None):
+                 structured: bool = True, timeout: float = DEFAULT_TIMEOUT,
+                 api_key: str | None = None, client=None):
         self.corpus = corpus or load_corpus()
         if retriever is None:
             from index.hybrid import HybridRetriever
@@ -180,7 +201,7 @@ class CRMAgent:
                 raise RuntimeError(
                     "OPENAI_API_KEY is not set.\n"
                     "  PowerShell (persistent): setx OPENAI_API_KEY '<your key>'")
-            client = OpenAI(api_key=key, max_retries=3)
+            client = OpenAI(api_key=key, max_retries=3, timeout=timeout)
         self.client = client
 
         self.history: list[dict[str, str]] = []
@@ -212,6 +233,12 @@ class CRMAgent:
             query = f"{question} {message}".strip()
             return (query, {"variation_scope": matched[0]}) if matched else (query, None)
 
+        # NOTE: `_topic` is the PREVIOUS user message, not the last
+        # self-contained one. A follow-up can change the subject -- "А во
+        # Струмица?" is phrased as a continuation but moves to a new
+        # municipality -- and anchoring on the last self-contained question
+        # meant a third turn reached back past it. Observed: turn 3 asked for
+        # examples of the Струмица agents just listed and retrieved Гостивар.
         if self._topic and is_followup(message):
             query = f"{self._topic} {message}".strip()
             forms = self._forms_of(self._last_service)
@@ -270,7 +297,7 @@ class CRMAgent:
         self.history.append({"role": "assistant", "content": _for_history(text)})
         # Remember what we asked about, so the next message can be read as a reply.
         self._pending = ((self._pending[0] if self._pending else message), amb) if amb else None
-        if self._pending is None and not is_followup(message):
+        if self._pending is None:
             self._topic = message
         self._last_service = (amb.id_service if amb else
                               _attributed_service(docs) or self._last_service)

@@ -59,6 +59,47 @@ def _norm(text: str) -> str:
     return unicodedata.normalize("NFKC", text).casefold()
 
 
+# Interrogatives and filler carry no topic, so they must never anchor a service.
+_GENERIC_WORDS = ("како", "каде", "кога", "колку", "кој", "која", "кои", "што",
+                  "дали", "може", "можам", "треба", "сакам", "имам", "ми")
+
+
+def _anchor_terms(query: str) -> set[str]:
+    from eval.text import stem, tokenize
+    generic = {stem(w) for w in _GENERIC_WORDS}
+    return {t for t in tokenize(query) if len(t) >= 4 and t not in generic}
+
+
+def anchored_services(hits: Sequence[Hit], corpus: Corpus, query: str) -> set[int]:
+    """Services the ORIGINAL question actually mentions.
+
+    Alias expansion appends registry vocabulary to the query, which is what
+    makes underspecified questions retrievable -- but the expanded terms can
+    also pull in an unrelated service, and structured fetch then AMPLIFIES that
+    by injecting the whole section.
+
+    Observed live: "Како да регистрирам залог?" had "упис, основање" appended,
+    the dense arm returned six `process` rows from service 2135 variant
+    Фондација, attribution locked onto it, and the agent answered a pledge
+    question with foundation-registration steps -- then asked which legal form.
+    Anchoring attribution to the words the user actually typed ("залог") keeps
+    the expansion helping recall without letting it choose the subject.
+    """
+    terms = _anchor_terms(query)
+    if not terms:
+        return set()
+    from eval.text import tokenize
+
+    out: set[int] = set()
+    for h in hits:
+        b = corpus.by_id.get(h.chunk_id)
+        if b is None or b.id_service is None or b.id_service in out:
+            continue
+        if terms & set(tokenize(f"{b.service_name} {b.content}")):
+            out.add(b.id_service)
+    return out
+
+
 @dataclass
 class Attribution:
     id_service: int | None = None
@@ -67,7 +108,8 @@ class Attribution:
 
 
 def attribute(hits: Sequence[Hit], corpus: Corpus,
-              filters: dict[str, Any] | None = None) -> Attribution:
+              filters: dict[str, Any] | None = None,
+              anchor_query: str | None = None) -> Attribution:
     """Which (service, variation) is this result set about?
 
     Only blocks with `id_variation > 0` are counted as evidence: shared
@@ -88,10 +130,14 @@ def attribute(hits: Sequence[Hit], corpus: Corpus,
     # guess -- it injects that sibling's whole section, flooding the context
     # with rows that answer a question nobody asked. Measured: trusting a single
     # hit dropped variation_documents hit@10 from 0.846 to 0.615.
+    anchored = anchored_services(hits, corpus, anchor_query) if anchor_query else set()
+
     votes: dict[tuple[int, int], list[int]] = {}
     for rank, h in enumerate(hits, 1):
         b = corpus.by_id.get(h.chunk_id)
         if b is not None and b.id_variation and not b.is_shared:
+            if anchored and b.id_service not in anchored:
+                continue          # the query never mentioned this service
             votes.setdefault((b.id_service, b.id_variation), []).append(rank)
     if votes:
         (sid, vid), ranks = max(votes.items(), key=lambda kv: (len(kv[1]), -min(kv[1])))
@@ -102,7 +148,7 @@ def attribute(hits: Sequence[Hit], corpus: Corpus,
 
     for rank, h in enumerate(hits, 1):
         b = corpus.by_id.get(h.chunk_id)
-        if b is not None:
+        if b is not None and (not anchored or b.id_service in anchored):
             return Attribution(b.id_service, None, rank)
     return Attribution()
 
@@ -131,7 +177,7 @@ def fetch_sections(corpus: Corpus, query: str, hits: Sequence[Hit], *,
     if not types:
         return []
 
-    attr = attribute(hits, corpus, filters)
+    attr = attribute(hits, corpus, filters, anchor_query=query)
     if attr.id_service is None:
         return []
 

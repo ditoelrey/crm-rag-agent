@@ -92,6 +92,23 @@ class EvalCase:
     # eval will not. A `clarify` case still carries retrieval gold: the agent
     # can only ask an informed question if the competing rows were retrievable.
     expect_behavior: str | None = None
+    # Checkable facts the answer must contain / must not contain. Exact values
+    # beat an LLM judge for this class of question: a fee is right or it isn't.
+    expect_values: list[str] = field(default_factory=list)
+    forbid_values: list[str] = field(default_factory=list)
+    # A conversation, when one question is not enough to expose the behaviour.
+    # `turns[0]` is `query`; assertions above apply to the FINAL answer, while
+    # `expect_turn_behaviors` (if given) grades each turn in order.
+    turns: list[str] = field(default_factory=list)
+    expect_turn_behaviors: list[str] = field(default_factory=list)
+
+    @property
+    def conversation(self) -> list[str]:
+        return self.turns or [self.query]
+
+    @property
+    def is_multi_turn(self) -> bool:
+        return len(self.conversation) > 1
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -375,8 +392,21 @@ def validate_cases(cases: Sequence[EvalCase], c: Corpus) -> None:
         seen.add(case.case_id)
         if not case.query.strip():
             problems.append(f"{case.case_id}: empty query")
-        if not any(g >= 2 for g in case.gold.values()):
+        if (not any(g >= 2 for g in case.gold.values())
+                and case.expect_behavior != "abstain" and not case.is_multi_turn):
             problems.append(f"{case.case_id}: no grade-2 (primary) gold item")
+        if case.turns and case.turns[0] != case.query:
+            problems.append(f"{case.case_id}: turns[0] must equal query")
+        if case.expect_turn_behaviors and \
+                len(case.expect_turn_behaviors) != len(case.conversation):
+            problems.append(
+                f"{case.case_id}: {len(case.expect_turn_behaviors)} turn "
+                f"behaviours for {len(case.conversation)} turns")
+        if case.expect_behavior == "abstain" and case.gold:
+            problems.append(f"{case.case_id}: an abstain case must have empty gold")
+        if case.expect_behavior not in (None, "answer", "clarify", "abstain"):
+            problems.append(f"{case.case_id}: unknown expect_behavior "
+                            f"{case.expect_behavior!r}")
         for cid, grade in case.gold.items():
             if cid not in c.by_id:
                 problems.append(f"{case.case_id}: gold chunk_id {cid!r} not in corpus")

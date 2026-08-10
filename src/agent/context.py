@@ -104,11 +104,38 @@ def build_documents(hits: Sequence[Hit], corpus: Corpus, *, dedup: bool = True,
 
 
 def _names_a_form(query: str, labels: Iterable[str]) -> bool:
+    """Did the user already say which variant they mean?
+
+    Substring matching alone is not enough. Observed live: asked "Кој е крајниот
+    рок за поднесување годишна сметка ЗА БАНКА?", the agent asked which subject
+    type -- because the variant is labelled "Банки и финансиски институции" and
+    "банки и финансиски институции" does not appear in a question that says
+    "банка". Matching the label's head noun through the Macedonian stemmer
+    (банки -> банк, банка -> банк) closes that gap without matching on the
+    generic words that follow it.
+    """
+    from eval.text import tokenize
+
     q = _norm(query)
-    return any(_norm(label) in q for label in labels)
+    q_tokens = set(tokenize(query))
+    for label in labels:
+        lab = _norm(label)
+        if len(lab) <= 5:
+            # Short labels ("АД") need a word boundary: a substring test fires
+            # inside "адреса".
+            if re.search(rf"(?<!\w){re.escape(lab)}(?!\w)", q):
+                return True
+            continue
+        if lab in q:
+            return True
+        head = tokenize(label)
+        if head and len(head[0]) >= 4 and head[0] in q_tokens:
+            return True
+    return False
 
 
-def _attributed_service(docs: Sequence[ContextDoc]) -> int | None:
+def _attributed_service(docs: Sequence[ContextDoc], query: str | None = None,
+                        corpus: Corpus | None = None) -> int | None:
     """Which service is the question actually about?
 
     Ranked by best position, but counting only blocks with `id_variation > 0`:
@@ -122,9 +149,22 @@ def _attributed_service(docs: Sequence[ContextDoc]) -> int | None:
     sat at rank 4. Ranking on shared blocks would have asked about the wrong
     service; this attribution picks 2135.
     """
+    anchored: set[int] = set()
+    if query and corpus is not None:
+        # Same guard as structured fetch: alias expansion can pull an unrelated
+        # service into the results, and asking the user to choose between ITS
+        # legal forms is worse than not asking at all. Observed live: a pledge
+        # question retrieved foundation-registration steps and the agent asked
+        # "АД or Здружение or Фондација?".
+        from index.structured import anchored_services
+        anchored = anchored_services([Hit(d.chunk_id, d.score) for d in docs],
+                                     corpus, query)
+
     best: tuple[int, int] | None = None      # (rank, id_service)
     for d in docs:
         if d.block.id_variation and not d.block.is_shared:
+            if anchored and d.block.id_service not in anchored:
+                continue
             if best is None or d.rank < best[0]:
                 best = (d.rank, d.block.id_service)
     return best[1] if best else None
@@ -213,7 +253,15 @@ def _detect_from_evidence(docs: Sequence[ContextDoc], query: str,
         # the same section can be replicated verbatim across variations. Verify
         # against the corpus, exactly as the structure detector does, so the two
         # paths cannot disagree about whether a choice is real.
-        types = sorted(set(conflicting) & intents) or sorted(conflicting)
+        # Only ever ask about a section the QUESTION is about. The fallback that
+        # used to sit here ("or sorted(conflicting)") asked about whatever
+        # happened to differ: "Дали годишна сметка може преку интернет?" has
+        # access intent, access is identical across all five variants -- but two
+        # variants' `process` rows were also in context, so the agent asked which
+        # subject type, for a link every variant shares.
+        types = sorted(set(conflicting) & intents)
+        if not types:
+            continue
         if corpus is not None:
             types = _differing_sections(corpus, sid, types)
             if not types:
@@ -235,7 +283,7 @@ def _detect_from_evidence(docs: Sequence[ContextDoc], query: str,
 
 def _detect_from_structure(docs: Sequence[ContextDoc], query: str,
                            corpus: Corpus) -> Ambiguity | None:
-    sid = _attributed_service(docs)
+    sid = _attributed_service(docs, query, corpus)
     if sid is None:
         return None
     variation_ids = corpus.variations_of.get(sid, [])

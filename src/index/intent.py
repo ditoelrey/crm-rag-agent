@@ -23,8 +23,12 @@ INTENT_CUES: dict[str, tuple[str, ...]] = {
     "tariffs": ("чин", "цена", "цени", "тариф", "надомест", "кошта", "плати",
                 "чинат", "пари"),
     "deadlines": ("рок", "колку време", "трае", "траење"),
-    "documents": ("документ", "потребн", "прилож", "доказ", "поднесам",
-                  "што треба", "поднесе"),
+    # "поднесе" was here to catch "Што треба да поднесам за X?" and fired on the
+    # ordinary passive "да се поднесе" instead -- it turned "Дали годишна сметка
+    # може да се поднесе преку интернет?" into a documents question and made the
+    # agent ask which legal form, for a service whose five variants share one
+    # identical link. "што треба" already covers the intended phrasing.
+    "documents": ("документ", "потребн", "прилож", "доказ", "што треба"),
     "access": ("онлајн", "интернет", "електронск", "плаќањ", "шалтер"),
     # "пријав" is deliberately absent: it is a NOUN in dozens of service names
     # ("Самостојна пријава за упис на основање"), so it fired on questions that

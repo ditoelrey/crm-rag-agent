@@ -190,6 +190,46 @@ def _structure_ambiguity_tests(c) -> None:
     check_true("no attribution from boilerplate alone",
                detect_ambiguity(only_shared, "Колку чини регистрација?", c) is None)
 
+    # --- fixtures from the first answer-eval run -------------------------- #
+    # Both were real clarifications the agent should never have asked.
+    from index.structured import attribute, fetch_sections
+
+    # "Како да регистрирам залог?" -- alias expansion appended "упис/основање",
+    # the dense arm returned six Фондација process rows, attribution locked onto
+    # service 2135 and the agent answered a pledge question with foundation
+    # steps, then asked which legal form.
+    drift = ["srv_2063_shared_terminology_2",
+             "srv_2135_v11117_process_1", "srv_2135_v11117_process_2",
+             "srv_2135_v11117_process_3", "srv_2135_v11117_process_4",
+             "srv_2063_v11187_forms_5", "srv_2135_v11117_process_5",
+             "srv_2063_v11187_forms_6", "srv_2135_v11117_process_6",
+             "srv_2063_v11187_documentsLocations_2"]
+    hits = _hits(drift)
+    check("unanchored attribution follows the alias drift",
+          attribute(hits, c).id_service, 2135)
+    check("anchoring keeps attribution on what was asked",
+          attribute(hits, c, anchor_query="Како да регистрирам залог?").id_service, 2063)
+    fetched = fetch_sections(c, "Како да регистрирам залог?", hits)
+    check_true("...and the right section is fetched",
+               bool(fetched) and all("2063" in cid for cid in fetched),
+               f"{len(fetched)} rows, first={fetched[0] if fetched else None}")
+    check_true("no clarification is asked for a single-variation service",
+               detect_ambiguity(build_documents(hits, c),
+                                "Како да регистрирам залог?", c) is None)
+
+    # "...годишна сметка ЗА БАНКА?" -- the user named the variant, but its label
+    # is "Банки и финансиски институции", so substring matching missed it.
+    bank = ["srv_2111_v11176_deadlines_1", "srv_2111_v11176_deadlines_2",
+            "srv_2111_v11179_deadlines_1"]
+    check_true("a named variant is recognised through its head noun",
+               detect_ambiguity(build_documents(_hits(bank), c),
+                                "Кој е крајниот рок за поднесување годишна "
+                                "сметка за банка?", c) is None)
+    check_true("...but an unnamed one still asks",
+               detect_ambiguity(build_documents(_hits(bank), c),
+                                "Кој е крајниот рок за поднесување годишна "
+                                "сметка?", c) is not None)
+
     xml = render_ambiguity(detect_ambiguity(docs, "Колку чини регистрација?", c))
     check_true("prompt warns the rows may be absent from the context",
                "may contain none of them" in xml)
@@ -264,6 +304,15 @@ def _clarification_tests(c) -> None:
                not is_followup("Како да регистрирам залог?"))
     check_true("a long real question stays self-contained",
                not is_followup("Кои документи се потребни за упис на основање?"))
+    # Observed in a multi-turn eval: turn 3 asked for examples of the agents
+    # just listed, was read as a new question, retrieved nothing and claimed to
+    # have no information about them -- one turn after listing forty-five.
+    check_true("a continuation request is a follow-up",
+               is_followup("Дај ми неколку како пример"))
+    check_true("...but a request that names its own subject is not",
+               not is_followup("Дај ми го ЗП образецот"))
+    check_true("...nor is one that names a place",
+               not is_followup("Дај ми список на адвокати во Прилеп"))
 
 
 def _orchestration_tests(c) -> None:
