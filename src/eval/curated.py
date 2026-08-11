@@ -327,6 +327,37 @@ SPECS: list[Spec] = [
                "useful and the thread is lost. The answer must still be about "
                "service 2162 -- the pickup counter -- not about whatever the "
                "bare question happens to match."),
+    # ----------------------------------------------------------------- #
+    # Completeness honesty.
+    #
+    # The <coverage> block tells the model which sections it holds in full. It
+    # fires in production -- a live answer volunteered "Оваа информација не е
+    # целосна" unprompted -- but nothing asserted it, so the guard could have
+    # been removed by any refactor without a single test going red.
+    #
+    # АД has 27 required-document rows and the context holds at most 10, so
+    # coverage always reports PARTIAL here. The question asks for ALL of them,
+    # which leaves the model no honest way out except to say the list is not
+    # complete.
+    # ----------------------------------------------------------------- #
+    Spec(query="Наброј ми ги сите документи потребни за упис на основање на АД",
+         values=("27|не е целосн|не се сите|не ги опфаќа сите|само дел|"
+                 "нецелосн|не располагам со сите|дополнителни извор|"
+                 "консултира|дополнителни документи може",),
+         forbid=("ова се сите документи", "ова е целосната листа"),
+         behavior="answer",
+         intent="completeness", service=2135, variation=11113,
+         types=("documents",),
+         notes="Any of the listed renderings counts, and `forbid` blocks the "
+               "explicit false claim. This assertion is LEXICAL and therefore "
+               "brittle: two runs disclaimed incompleteness in different words "
+               "('не е целосната листа' / 'консултираат дополнителни "
+               "извори') and the first list missed the second. Note that "
+               "'целосн' cannot be matched on its own -- it is the root of "
+               "both 'is complete' and 'is NOT complete'. The robust version of "
+               "this check is the post-generation completeness comparison "
+               "(count rows in context vs items enumerated in the answer), "
+               "which is deferred."),
 ]
 
 

@@ -503,13 +503,27 @@ def _structured_fetch_tests(c) -> None:
                len(r.last_sections) <= 6, f"{len(r.last_sections)} rows at k=10")
 
 
+def _injection_tests(c) -> None:
+    """Corpus text must never restructure the context it is rendered into.
+
+    Offline half of agent/injection.py -- the behavioural half needs a model
+    call and lives behind `python -m agent.injection --live`.
+    """
+    print("[prompt injection -- structural]")
+    from .injection import PAYLOADS, check_structural
+    for r in check_structural(c):
+        check_true(f"{r.payload} is neutralised", r.ok, r.detail)
+    check_true("every payload declares why it exists",
+               all(p.why for p in PAYLOADS), f"{len(PAYLOADS)} payloads")
+
+
 def main() -> int:
     _failures.clear()
     c = load_corpus()
     print(f"corpus: {len(c)} blocks, sha={c.sha256[:12]}\n")
     for stage in (_dedup_tests, _ambiguity_tests, _structure_ambiguity_tests,
                   _structured_fetch_tests, _citation_tests, _clarification_tests,
-                  _orchestration_tests):
+                  _injection_tests, _orchestration_tests):
         try:
             stage(c)
         except Exception:

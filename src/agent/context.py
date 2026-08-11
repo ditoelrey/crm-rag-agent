@@ -309,7 +309,21 @@ def _detect_from_structure(docs: Sequence[ContextDoc], query: str,
 
 
 def _esc(text: str) -> str:
+    """Escape for an element BODY."""
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _esc_attr(text: str) -> str:
+    """Escape for an ATTRIBUTE value -- quotes included.
+
+    Attribute values come from corpus strings (service_name, variant label,
+    also_in). No current name contains a straight quote, so this is a latent
+    hole rather than a live one, but a portal-authored name containing `"` would
+    close the attribute and inject attributes of its own -- including a second
+    `section=`, which would make a documents block present itself to the model
+    as tariffs. agent/injection.py verifies this, and fails when it is removed.
+    """
+    return _esc(text).replace('"', "&quot;").replace("'", "&#39;")
 
 
 def render_documents(docs: Iterable[ContextDoc]) -> str:
@@ -318,20 +332,20 @@ def render_documents(docs: Iterable[ContextDoc]) -> str:
     out = ["<documents>"]
     for d in docs:
         b = d.block
-        attrs = [f'id="{_esc(b.chunk_id)}"',
-                 f'service="{_esc(b.service_name)}"',
-                 f'section="{_esc(b.type)}"']
+        attrs = [f'id="{_esc_attr(b.chunk_id)}"',
+                 f'service="{_esc_attr(b.service_name)}"',
+                 f'section="{_esc_attr(b.type)}"']
         if b.variation_short_name:
             # NOT "legal_form": 31% of variation labels are delivery channels
             # ("Хартиено на шалтер", "Електронски", "Web сервис") or scopes
             # ("Упис на залог"), not legal forms. Calling them all legal forms
             # taught the model to ask "За каква правна форма?" about a paper-vs-
             # electronic choice, and about services that have only one variant.
-            attrs.append(f'variant="{_esc(b.variation_short_name)}"')
+            attrs.append(f'variant="{_esc_attr(b.variation_short_name)}"')
         if b.is_shared:
             attrs.append('applies_to="all variants of this service"')
         if d.also_in:
-            attrs.append(f'also_applies_to="{_esc("; ".join(d.also_in[:4]))}"')
+            attrs.append(f'also_applies_to="{_esc_attr("; ".join(d.also_in[:4]))}"')
         out.append(f"  <document {' '.join(attrs)}>")
         out.append("    " + _esc(b.content).replace("\n", "\n    "))
         out.append("  </document>")
@@ -393,22 +407,64 @@ def section_coverage(docs: Sequence[ContextDoc],
     return sorted(out)
 
 
-def render_coverage(docs: Sequence[ContextDoc], corpus: Corpus | None) -> str:
+def render_coverage(docs: Sequence[ContextDoc], corpus: Corpus | None,
+                    query: str | None = None) -> str:
+    """Tell the model what it holds in full -- for the section it was ASKED about.
+
+    Two changes driven by a live false positive. Asked "кои се чекорите ... преку
+    шалтер", the agent listed all four steps correctly and then hedged that the
+    list might be incomplete. The block had said:
+
+        instructions (Хартиено на шалтер): 1 of 2  -> PARTIAL
+        process      (Хартиено на шалтер): 4 of 4  -> COMPLETE
+
+    The procedure WAS complete. An unrelated `instructions` section was not, and
+    the model applied that caveat to its answer about steps. So:
+
+      * report only sections matching the question's intent, so a PARTIAL line
+        about something nobody asked about cannot trigger a hedge;
+      * state COMPLETE positively. Previously this block carried only a warning
+        about PARTIAL, leaving "you have everything" to be inferred from
+        silence -- and a model reading a warning-shaped block hedges.
+
+    With no readable intent every section is reported: an unclear question is a
+    reason to give the model more information, not less.
+    """
     if corpus is None:
         return ""
     rows = section_coverage(docs, corpus)
     if not rows:
         return ""
+
+    intents = set(detect_intent(query)) if query else set()
+    if intents:
+        rows = [r for r in rows if r[0] in intents]
+    if not rows:
+        return ""
+
     lines = []
+    any_partial = any_complete = False
     for type_, variant, present, total in rows:
         where = f" ({_esc(variant)})" if variant else ""
-        state = ("COMPLETE" if present >= total
-                 else f"PARTIAL -- {total - present} row(s) of this section are not here")
+        if present >= total:
+            any_complete = True
+            state = "COMPLETE"
+        else:
+            any_partial = True
+            state = f"PARTIAL -- {total - present} row(s) of this section are not here"
         lines.append(f"  {type_}{where}: {present} of {total} rows -- {state}")
-    return ("\n<coverage>\n" + "\n".join(lines) + "\n"
+
+    guidance = []
+    if any_complete:
+        guidance.append(
+            "A COMPLETE section is the whole thing: present it as the full set "
+            "and do NOT add a caveat about possibly missing entries.")
+    if any_partial:
+        guidance.append(
             "A PARTIAL section must never be presented as a full list. Either "
-            "omit it, or say explicitly that it is not the complete set.\n"
-            "</coverage>")
+            "omit it, or say explicitly that it is not the complete set.")
+    return ("\n<coverage>\n" + "\n".join(lines) + "\n"
+            + "\n".join(guidance) + "\n</coverage>")
 
 
 def render_ambiguity(amb: Ambiguity | None, corpus: Corpus | None = None) -> str:
@@ -424,7 +480,7 @@ def render_ambiguity(amb: Ambiguity | None, corpus: Corpus | None = None) -> str
             f"The service \"{_esc(amb.service_name)}\" exists in "
             f"{len(amb.variations)} variants whose {', '.join(amb.section_types)} "
             f"are DIFFERENT. The documents above may contain none of them, or only "
-            f"one form's — either way they are not a safe basis for an answer. "
+            f"one variant's -- either way they are not a safe basis for an answer. "
             f"The available variants are:")
     else:
         lead = (
@@ -445,7 +501,7 @@ def build_context(hits: Sequence[Hit], corpus: Corpus, query: str, *,
                   ) -> tuple[str, list[ContextDoc], Ambiguity | None]:
     docs = build_documents(hits, corpus, dedup=dedup, limit=limit)
     amb = detect_ambiguity(docs, query, corpus)
-    xml = (render_documents(docs) + render_coverage(docs, corpus)
+    xml = (render_documents(docs) + render_coverage(docs, corpus, query)
            + render_ambiguity(amb, corpus))
     return xml, docs, amb
 

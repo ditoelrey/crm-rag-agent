@@ -29,7 +29,12 @@ INTENT_CUES: dict[str, tuple[str, ...]] = {
     # agent ask which legal form, for a service whose five variants share one
     # identical link. "што треба" already covers the intended phrasing.
     "documents": ("документ", "потребн", "прилож", "доказ", "што треба"),
-    "access": ("онлајн", "интернет", "електронск", "плаќањ", "шалтер"),
+    # "шалтер" is deliberately absent. It names a delivery CHANNEL and almost
+    # always appears as a modifier ("преку шалтер", "на шалтер"), so it beat the
+    # subject word in "кои се ЧЕКОРИТЕ ... преку шалтер" and routed a procedure
+    # question to `access`. Pickup questions still reach documentsLocations via
+    # "подигн"; genuine access questions via онлајн / интернет / електронск.
+    "access": ("онлајн", "интернет", "електронск", "плаќањ"),
     # "пријав" is deliberately absent: it is a NOUN in dozens of service names
     # ("Самостојна пријава за упис на основање"), so it fired on questions that
     # merely named a service and injected its procedure over the description.
