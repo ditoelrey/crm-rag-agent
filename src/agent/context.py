@@ -52,6 +52,10 @@ class ContextDoc:
     score: float
     rank: int
     also_in: list[str] = field(default_factory=list)   # other services with identical text
+    # True when structured fetch injected this row rather than the semantic arm
+    # retrieving it. It is still context the model may use -- it is just not
+    # EVIDENCE of what the user asked about, because we chose it, not the query.
+    injected: bool = False
 
 
 @dataclass
@@ -67,12 +71,28 @@ class Ambiguity:
         return [label for _, label in self.variations]
 
 
+# Slots that injection may never take, so the semantic arm always has a voice.
+SEMANTIC_RESERVE = 3
+
+
 def _norm(text: str) -> str:
     return unicodedata.normalize("NFKC", text).casefold()
 
 
+# Runs of single letters separated by dots -- "а.д.", "a.d.", "д.о.о." -- are how
+# people punctuate these abbreviations, and the registry never does. Collapsing
+# them is scoped to that shape on purpose: it must not touch "e-submit.crm.com.mk"
+# or any other dotted string, so each segment has to be exactly one character.
+_DOTTED_RE = re.compile(r"\b(?:\w\.){2,4}")
+
+
+def _collapse_dotted(text: str) -> str:
+    return _DOTTED_RE.sub(lambda m: m.group(0).replace(".", ""), text)
+
+
 def build_documents(hits: Sequence[Hit], corpus: Corpus, *, dedup: bool = True,
-                    limit: int | None = None) -> list[ContextDoc]:
+                    limit: int | None = None,
+                    pin: Iterable[str] = ()) -> list[ContextDoc]:
     """Rank-ordered documents, optionally collapsing byte-identical content.
 
     `limit` counts DISTINCT documents, which is why the caller over-fetches:
@@ -80,9 +100,22 @@ def build_documents(hits: Sequence[Hit], corpus: Corpus, *, dedup: bool = True,
     byte-identical copies. Asking for more hits and trimming to `limit` distinct
     ones costs nothing extra (the hybrid arms already search to depth 50, and
     the query is embedded once either way).
+
+    `pin` guarantees specific chunk_ids survive the trim -- in practice the rows
+    structured fetch deliberately injected. Without it a COMPLETE section can
+    lose its tail: injected rows are fused by RRF, so row 6 of a section scores
+    1/(60+6) = 0.0152 while the best semantic hit scores 1/61 = 0.0164, and a
+    few strong semantic hits push the last step past the cut. Observed live on
+    "бришење на залог": five of six process steps reached the model, which then
+    correctly reported that one was missing. The section was fetched whole and
+    then trimmed apart.
+
+    Pinning cannot starve the semantic arm, because structured fetch already
+    caps injection at half the requested slots.
     """
     docs: list[ContextDoc] = []
     by_content: dict[str, ContextDoc] = {}
+    injected_ids = set(pin)
 
     for rank, hit in enumerate(hits, 1):
         block = corpus.by_id.get(hit.chunk_id)
@@ -90,20 +123,85 @@ def build_documents(hits: Sequence[Hit], corpus: Corpus, *, dedup: bool = True,
             continue
         if dedup and block.content in by_content:
             kept = by_content[block.content]
+            # A row counts as injected only if EVERY copy of it was injected.
+            # This text is byte-identical across variations, so structured fetch
+            # and the semantic arm routinely return different copies of it; if
+            # the injected copy happens to rank first, marking the survivor
+            # "injected" would discard the fact that search found it too.
+            if block.chunk_id not in injected_ids:
+                kept.injected = False
             if block.service_name and block.service_name not in kept.also_in \
                     and block.service_name != kept.block.service_name:
                 kept.also_in.append(block.service_name)
             continue
         doc = ContextDoc(chunk_id=block.chunk_id, block=block,
-                         score=hit.score, rank=rank)
+                         score=hit.score, rank=rank,
+                         injected=block.chunk_id in injected_ids)
         by_content[block.content] = doc
         docs.append(doc)
-        if limit is not None and len(docs) >= limit:
-            break
-    return docs
+
+    if limit is None or len(docs) <= limit:
+        return _in_reading_order(docs)
+
+    # Injection may not take EVERY slot. Structured fetch caps itself against the
+    # RETRIEVER's k, but the agent over-fetches 4x and trims here, so a cap of
+    # 15-out-of-40 upstream still let 10-out-of-10 through at this end: the whole
+    # context became one variation's `documents` section and the semantic arm was
+    # squeezed out completely. It is the semantic arm that recovers a wrong
+    # attribution, so it cannot be what disappears when attribution is wrong.
+    #
+    # A floor, not a fraction. Reserving HALF was tried and rejected: the longest
+    # section this has to deliver intact is 6 rows (pledge deletion), which is
+    # more than half of the k=10 context, so a half-cap would re-break the very
+    # completeness failure pinning was added to fix.
+    pinned_ids = set(pin)
+    pinned = [d for d in docs
+              if d.chunk_id in pinned_ids][:max(1, limit - SEMANTIC_RESERVE)]
+    others = [d for d in docs if d.chunk_id not in pinned_ids]
+    keep = pinned + others[:max(0, limit - len(pinned))]
+    return _in_reading_order(keep)
 
 
-def _names_a_form(query: str, labels: Iterable[str]) -> bool:
+_ROW_NO_RE = re.compile(r"_(\d+)$")
+
+
+def _section_of(block: Block) -> tuple:
+    return (block.id_service, block.id_variation, block.type)
+
+
+def _row_no(chunk_id: str) -> int:
+    m = _ROW_NO_RE.search(chunk_id)
+    return int(m.group(1)) if m else 0
+
+
+def _in_reading_order(docs: list[ContextDoc]) -> list[ContextDoc]:
+    """Sections in rank order, but rows WITHIN a section in the registry's order.
+
+    Sorting purely by fused rank scrambles a numbered procedure. Observed live on
+    "кои се чекорите за упис на вистински сопственик": all five steps were
+    retrieved and pinned, and the model was handed them as 4, 1, 5, 2, 3 -- then
+    answered with 1, 2, 4, 5, having lost one while reassembling the order. It
+    found step 3 immediately when asked directly, so this was never retrieval.
+    A procedure is not a bag of rows; its order is part of its meaning.
+    """
+    best: dict[tuple, int] = {}
+    for d in docs:
+        key = _section_of(d.block)
+        best[key] = min(best.get(key, d.rank), d.rank)
+    return sorted(docs, key=lambda d: (best[_section_of(d.block)],
+                                       _row_no(d.chunk_id), d.rank))
+
+
+def _label_aliases(label: str, corpus: Corpus | None) -> tuple[str, ...]:
+    """The label plus the words users type for it, from the corpus glossary."""
+    if corpus is None:
+        return ()
+    from index.aliases import form_synonyms
+    return tuple(form_synonyms(label, corpus))
+
+
+def _names_a_form(query: str, labels: Iterable[str],
+                  corpus: Corpus | None = None) -> bool:
     """Did the user already say which variant they mean?
 
     Substring matching alone is not enough. Observed live: asked "Кој е крајниот
@@ -116,9 +214,31 @@ def _names_a_form(query: str, labels: Iterable[str]) -> bool:
     """
     from eval.text import tokenize
 
+    query = _collapse_dotted(query)
     q = _norm(query)
     q_tokens = set(tokenize(query))
     for label in labels:
+        # Also the words a user would actually type. The registry's label is
+        # "ПДОО"; nobody writes that -- they write ДОО or ДООЕЛ. Asked which
+        # documents "доо" needs, the agent offered a nine-form menu whose fourth
+        # entry was "ПДОО (... / ДОО / ДООЕЛ)": it had the answer and asked the
+        # user to repeat themselves. match_variation() already resolves replies
+        # through these synonyms, so recognising them only here was the gap.
+        for alias in _label_aliases(label, corpus):
+            a = _norm(alias)
+            if len(a) <= 5:
+                if re.search(rf"(?<!\w){re.escape(a)}(?!\w)", q):
+                    return True
+            elif a in q:
+                return True
+        # A label can list several forms at once -- "ДОО, ДООЕЛ" is one variation
+        # covering two. Each part has to match on its own: the head-noun rule
+        # below needs 4+ characters and "ДОО" is three, so before the corpus was
+        # complete this label matched nothing and "доо" fell through to ПДОО --
+        # the SIMPLIFIED track, a different procedure.
+        for part in (p.strip() for p in label.split(",")):
+            if len(part) > 1 and re.search(rf"(?<!\w){re.escape(_norm(part))}(?!\w)", q):
+                return True
         lab = _norm(label)
         if len(lab) <= 5:
             # Short labels ("АД") need a word boundary: a substring test fires
@@ -178,12 +298,171 @@ def _differing_sections(corpus: Corpus, id_service: int,
     share one identical access block, and that must not trigger a question."""
     out = []
     for type_ in types:
-        seen = {tuple(sorted(b.content for b in corpus.of_type(id_service, type_, vid)))
+        seen = {tuple(sorted(_row_signature(b)
+                             for b in corpus.of_type(id_service, type_, vid)))
                 for vid in corpus.variations_of.get(id_service, ())}
         seen.discard(())
         if len(seen) >= 2:
             out.append(type_)
     return out
+
+
+_NUM_RE = re.compile(r"\d[\d.,]*")
+
+
+def _row_signature(block: Block) -> str:
+    """What a row would CHANGE about the answer, with wording removed.
+
+    Comparing raw text asks "is this byte-identical", when the question is "would
+    the user be told something different". Two examples from one corpus rebuild:
+
+      * service 2162's fee is 295 МКД whether you file at the counter or online.
+        Only the label differs -- "Потврда за тековна состојба на субјект" versus
+        "Тековна состојба на субјект" -- so byte-comparison called the section
+        variant-specific and the agent asked which channel before quoting a
+        number that is the same either way.
+      * service 2111's access rows are the same URL written /sso/ under some
+        forms and /SSO/ under others.
+
+    For a fee the answer IS the amount, so tariffs compare on their numbers.
+    Everything else compares on case- and whitespace-normalised text, which
+    removes the second kind without pretending prose is interchangeable: a
+    document called something else is a different document.
+    """
+    if block.type == "tariffs":
+        return "|".join(_NUM_RE.findall(block.content))
+    return " ".join(_norm(block.content).split())
+
+
+def _is_universal(corpus: Corpus, sid: int, block: Block) -> bool:
+    """Is this exact row present in EVERY variation that has a section of its type?
+
+    Such a row is shared in everything but the flag. The corpus files one physical
+    copy per variation, so "Преведени и заверени документи" exists nine times under
+    service 2135 -- once per legal form, byte for byte. `is_shared` is False on all
+    nine, and build_documents() then dedups them down to one arbitrarily-labelled
+    copy, so a detector counting labels reads "АД said one thing, Подружница said
+    another" about a row on which the two agree completely.
+
+    Variations with no rows of this type are skipped, exactly as
+    _differing_sections() does: silence is not disagreement.
+    """
+    vids = [v for v in corpus.variations_of.get(sid, ())
+            if corpus.of_type(sid, block.type, v)]
+    if len(vids) < 2:
+        return False
+    return all(any(b.content == block.content
+                   for b in corpus.of_type(sid, block.type, v))
+               for v in vids)
+
+
+# Does the question want ONE row, or the section as a set?
+#
+# This distinction was proposed, rejected for thin evidence (it changed exactly
+# one case), and then earned its place: after the attribution fix it is the ONLY
+# signal separating two questions that reach the detector in an identical state.
+#
+#   "Кои документи ми требаат за да регистрирам фирма?"   -> the whole list, and
+#       the list really does differ per form, so this MUST ask.
+#   "Имам доказ ... на англиски јазик. Што точно треба да направам со него?"
+#       -> one row, which is identical in all nine forms.
+#
+# Both retrieve a mix of universal and form-specific `documents` rows, so a rule
+# reading only the rows cannot tell them apart: requiring every row to be
+# universal keeps the second question asking, and accepting any universal row
+# silences the first. Measured both ways -- see selftest.
+_ENUMERATIVE_CUES = ("кои", "сите", "наброј", "список", "колку", "каде")
+_TARGETED_CUES = ("дали", "имам", "мојот", "мојата", "што точно", "со него")
+
+
+def _is_targeted(query: str) -> bool:
+    """Is the question about one specific thing rather than a whole section?"""
+    q = _norm(query)
+    return (any(t in q for t in _TARGETED_CUES)
+            and not any(e in q for e in _ENUMERATIVE_CUES))
+
+
+def _known_form_names(corpus: Corpus) -> set[str]:
+    """Every legal form the CORPUS knows, not just one service's variants.
+
+    Includes the all-caps abbreviations that appear inside longer labels, because
+    that is the only place some forms exist: "ТП" is never a label on its own,
+    only a token in "Подружница на странско друштво и странски ТП".
+
+    Only labels the corpus REUSES across services count. A variation label is not
+    always a legal form -- it can be a scope ("Упис на залог", "Упис на лизинг")
+    or a channel -- and scope labels are service-specific, so requiring two or
+    more services filters them out. Without that filter this matched the ordinary
+    question "Колку чини упис на основање?" against six different "Упис ..."
+    labels through their shared head noun, and silenced the disambiguation that
+    question exists to trigger. Caught by selftest.
+    """
+    cached = getattr(corpus, "_form_names", None)
+    if cached is not None:
+        return cached
+    labels = _legal_forms(corpus)
+    abbrevs = {t for lab in labels for t in re.findall(r"[А-ШЀ-ӿA-Z]{2,6}", lab)
+               if t.isupper() and len(t) >= 2}
+    out = labels | abbrevs
+    setattr(corpus, "_form_names", out)
+    return out
+
+
+def _legal_forms(corpus: Corpus) -> set[str]:
+    """Variation labels that name a LEGAL FORM rather than a scope or a channel.
+
+    Reused across services, OR carrying a glossary expansion. The second clause
+    exists for ПДОО, a real legal form that only one service offers, and it is
+    exactly as precise: of the single-service labels, ПДОО is the only one the
+    glossary knows. Scope labels like "Упис на залог" abbreviate nothing and
+    match neither.
+
+    One definition, used by both named_forms() and _known_form_names(). They had
+    separate rules once, which meant a form could be recognised well enough to
+    scope retrieval yet not well enough to be called absent from a menu.
+    """
+    cached = getattr(corpus, "_legal_forms", None)
+    if cached is not None:
+        return cached
+    from index.aliases import form_synonyms
+    services: dict[str, set[int]] = {}
+    for b in corpus:
+        if b.variation_short_name:
+            services.setdefault(b.variation_short_name, set()).add(b.id_service)
+    out = {lab for lab, sids in services.items()
+           if len(sids) >= 2 or len(form_synonyms(lab, corpus)) > 1}
+    setattr(corpus, "_legal_forms", out)
+    return out
+
+
+def named_forms(query: str, corpus: Corpus) -> list[str]:
+    """Legal-form labels the query names outright, for scoping retrieval.
+
+    Only labels the corpus reuses across services count, so a scope label like
+    "Упис на залог" cannot be mistaken for a legal form -- same rule as
+    _known_form_names(), and for the same reason.
+
+    Live: "кои се потребните документи за да регистрирам доо" came back with ten
+    Фондација rows, because nothing downstream knew the question had already
+    named its form. Recognising it and never using it left the agent honest but
+    useless: it abstained while holding another form's documents.
+    """
+    return sorted(lab for lab in _legal_forms(corpus)
+                  if _names_a_form(query, [lab], corpus))
+
+
+def _names_absent_form(query: str, corpus: Corpus, own: Iterable[str]) -> bool:
+    """Did the user name a legal form this service does not offer?
+
+    Then the ATTRIBUTION is wrong, and a clarification is the one answer that
+    cannot help: the list we would show them cannot contain the form they just
+    told us. Observed live -- "Дали ми треба потврда од банка пред да го избришам
+    мојот ТП" was met with "choose: АД, Заедница на сопственици, ...", none of
+    which is a ТП. The user had already been specific; the system could not see
+    it, and asked them to be specific again.
+    """
+    return (not _names_a_form(query, own, corpus)
+            and _names_a_form(query, _known_form_names(corpus), corpus))
 
 
 def detect_ambiguity(docs: Sequence[ContextDoc], query: str,
@@ -243,6 +522,23 @@ def _detect_from_evidence(docs: Sequence[ContextDoc], query: str,
             b = d.block
             if b.is_shared or not b.id_variation or not b.variation_short_name:
                 continue
+            # Rows WE injected cannot testify about which form the user meant.
+            # Structured fetch resolves one variation and pastes its whole
+            # section in, so counting those rows makes the detector answer a
+            # question it asked itself: on "Имам доказ ... на англиски јазик",
+            # five Фондација `documents` rows arrived by injection and one
+            # Подружница row by search, and the detector reported that two forms
+            # disagreed -- a disagreement structured fetch had manufactured.
+            if d.injected:
+                continue
+            # A row every variation carries is evidence of agreement, not of
+            # conflict. Live: "Имам доказ за регистрација кој е на англиски
+            # јазик -- што да правам со него?" was answered from documents_1,
+            # which is identical across all nine forms of service 2135, and the
+            # agent then asked the user to choose between the nine to pick a row
+            # that is the same in all of them.
+            if corpus is not None and _is_universal(corpus, sid, b):
+                continue
             per_type.setdefault(b.type, {})[b.id_variation] = b.variation_short_name
 
         conflicting = {t: v for t, v in per_type.items() if len(v) >= 2}
@@ -272,7 +568,10 @@ def _detect_from_evidence(docs: Sequence[ContextDoc], query: str,
             variations.update(v)
         variations = _all_forms(corpus, sid, variations)
         # The user already named one of them -> not ambiguous, just answer.
-        if _names_a_form(query, variations.values()):
+        if _names_a_form(query, variations.values(), corpus):
+            return None
+        if corpus is not None and _names_absent_form(query, corpus,
+                                                     variations.values()):
             return None
         return Ambiguity(id_service=sid,
                          service_name=group[0].block.service_name,
@@ -290,16 +589,53 @@ def _detect_from_structure(docs: Sequence[ContextDoc], query: str,
     if len(variation_ids) < 2:
         return None
 
-    intents = detect_intent(query)
+    # The TOP intent only -- the section the question is actually about. Reading
+    # every intent meant any one of them differing was enough to interrupt: "Каде
+    # ја подигам потврдата за тековна состојба?" resolves to documentsLocations,
+    # documents AND process, and although the pickup rows are identical across
+    # both channels, the process rows are not, so the agent asked which channel
+    # before answering a question whose answer does not depend on it. Structured
+    # fetch has always used top_only for the same reason -- it fetches the
+    # section asked for, not everything the wording brushes against.
+    intents = detect_intent(query, top_only=True)
     if not intents:
         return None                      # unclear intent -> do not guess
     differing = _differing_sections(corpus, sid, intents)
     if not differing:
         return None                      # the choice would not change the answer
 
+    # _differing_sections works at SECTION granularity, but a question is usually
+    # about one row inside it. When every row actually retrieved for the asked-
+    # about section is universal, the section differing elsewhere is irrelevant:
+    # the user would be choosing a form to select content identical in all of
+    # them. Deliberately strict -- ONE variant-specific row is enough to keep the
+    # question, because that row may be the answer. "Каде можам да го подигнам
+    # документот" must still ask: two of the eight forms have no electronic
+    # pickup row at all, so a shared counter row does not make the answer shared.
+    # Injected rows are excluded for the same reason as in the evidence
+    # detector: they describe the variation structured fetch chose, not the one
+    # the user asked about. If NOTHING but injected rows is present, the semantic
+    # arm found nothing on this section and the question stands.
+    retrieved = [d.block for d in docs
+                 if not d.injected
+                 and d.block.id_service == sid and d.block.type in differing]
+    if retrieved:
+        universal = [b for b in retrieved if _is_universal(corpus, sid, b)]
+        if len(universal) == len(retrieved):
+            return None
+        # A pointed question is answered by ONE row. If a universal row is among
+        # what search returned, that row can answer it whatever form the user
+        # has, and the form-specific rows beside it are not what was asked
+        # about. An enumerative question consumes the whole section, so there a
+        # single form-specific row is enough to make the choice matter.
+        if universal and _is_targeted(query):
+            return None
+
     labels = {vid: corpus.variation_name.get((sid, vid), "") for vid in variation_ids}
     labels = {vid: name for vid, name in labels.items() if name}
-    if len(labels) < 2 or _names_a_form(query, labels.values()):
+    if len(labels) < 2 or _names_a_form(query, labels.values(), corpus):
+        return None
+    if _names_absent_form(query, corpus, labels.values()):
         return None
 
     return Ambiguity(id_service=sid,
@@ -463,6 +799,12 @@ def render_coverage(docs: Sequence[ContextDoc], corpus: Corpus | None,
         guidance.append(
             "A PARTIAL section must never be presented as a full list. Either "
             "omit it, or say explicitly that it is not the complete set.")
+    guidance.append(
+        "This block is internal bookkeeping. Never quote its counts or the word "
+        "'rows' back to the user -- an answer saying 'има информации за само 10 "
+        "од 28 реда' exposes how the system works and means nothing to someone "
+        "asking about documents. Say in plain Macedonian that the list is not "
+        "complete.")
     return ("\n<coverage>\n" + "\n".join(lines) + "\n"
             + "\n".join(guidance) + "\n</coverage>")
 
@@ -496,10 +838,30 @@ def render_ambiguity(amb: Ambiguity | None, corpus: Corpus | None = None) -> str
     )
 
 
+_CHANNEL_WORDS = ("хартиено", "електронски", "шалтер", "web", "сервис", "пошта")
+
+
+def clarification_text(amb: Ambiguity, corpus: Corpus | None = None) -> str:
+    """The clarification, written by us rather than asked of the model.
+
+    Mutual exclusion cannot be a prompt rule. Told to ask INSTEAD of answering,
+    the model still answered and appended the menu -- on a hallucinated document
+    list, with a coverage hedge, and the options underneath. Three mutually
+    contradictory things in one reply. Composing the question here makes the
+    rule structural: when the detector fires there is no model output to leak.
+    """
+    labels = [form_label(label, corpus) for _, label in amb.variations]
+    channel = all(any(w in _norm(l) for w in _CHANNEL_WORDS) for l in labels)
+    lead = ("На кој начин сакате да ја користите услугата?" if channel
+            else "За каква правна форма станува збор?")
+    return lead + "\n\n" + "\n".join(f"- {l}" for l in labels)
+
+
 def build_context(hits: Sequence[Hit], corpus: Corpus, query: str, *,
-                  dedup: bool = True, limit: int | None = None
+                  dedup: bool = True, limit: int | None = None,
+                  pin: Iterable[str] = ()
                   ) -> tuple[str, list[ContextDoc], Ambiguity | None]:
-    docs = build_documents(hits, corpus, dedup=dedup, limit=limit)
+    docs = build_documents(hits, corpus, dedup=dedup, limit=limit, pin=pin)
     amb = detect_ambiguity(docs, query, corpus)
     xml = (render_documents(docs) + render_coverage(docs, corpus, query)
            + render_ambiguity(amb, corpus))

@@ -18,9 +18,13 @@ from types import SimpleNamespace
 from eval.corpus import load as load_corpus
 from eval.retriever import Hit
 
-from .agent import CRMAgent, is_followup, match_variation
-from .context import (build_context, build_documents, detect_ambiguity,
-                      detect_intent, render_ambiguity, validate_citations)
+from .agent import PRICING, CRMAgent, is_followup, match_variation
+from .context import (_collapse_dotted, _detect_from_evidence, _is_targeted,
+                      _is_universal,
+                      _known_form_names, _names_absent_form, build_context,
+                      build_documents, named_forms,
+                      detect_ambiguity, detect_intent, render_ambiguity,
+                      validate_citations)
 
 _failures: list[str] = []
 
@@ -104,7 +108,7 @@ def _ambiguity_tests(c) -> None:
         # Observed live: a question that retrieved two forms offered the user
         # only those two, leaving the other seven unreachable.
         check("offers every form, not only the retrieved ones",
-              len(amb.variations), 9)
+              len(amb.variations), 11)
 
     # Same documents, but the user already said which form.
     amb2 = detect_ambiguity(docs, "Колку чини упис на основање на Здружение?", c)
@@ -115,11 +119,11 @@ def _ambiguity_tests(c) -> None:
     access = [b.chunk_id for b in c.by_service[2111] if b.type == "access"]
     docs3 = build_documents(_hits(access), c)
     amb3 = detect_ambiguity(docs3, "Дали годишна сметка може онлајн?", c)
-    check("identical access blocks collapse to one", len(docs3), 1)
+    check("near-identical access blocks collapse", len(docs3), 2)
     check_true("does not fire when the forms agree", amb3 is None)
 
     # A single-variation service is never ambiguous.
-    solo = [b.chunk_id for b in c.by_service[2162] if b.type == "tariffs"]
+    solo = [b.chunk_id for b in c.by_service[2029] if b.type == "tariffs"]
     amb4 = detect_ambiguity(build_documents(_hits(solo), c), "Колку чини?", c)
     check_true("does not fire for a single-variation service", amb4 is None)
 
@@ -157,7 +161,7 @@ def _structure_ambiguity_tests(c) -> None:
         check("detector source recorded", amb.source, "structure")
         check("asks about the section the user asked about",
               amb.section_types, ["tariffs"])
-        check_true("offers every legal form", len(amb.variations) == 9,
+        check_true("offers every legal form", len(amb.variations) == 11,
                    f"{len(amb.variations)}: {', '.join(amb.labels[:3])}...")
 
     check("intent detection reads the question", detect_intent("Колку чини регистрација?"),
@@ -230,6 +234,132 @@ def _structure_ambiguity_tests(c) -> None:
                                 "Кој е крајниот рок за поднесување годишна "
                                 "сметка?", c) is not None)
 
+    # --- universal rows are agreement, not conflict ----------------------- #
+    # Live: the agent answered "what do I do with an English-language document?"
+    # from documents_1 of service 2135 -- byte-identical across all NINE legal
+    # forms -- and then asked the user to choose between the nine. The corpus
+    # files one physical copy per variation, so is_shared is False on every one,
+    # and build_documents() dedups them to a single arbitrarily-labelled copy.
+    universal = "srv_2135_v11113_documents_1"
+    variant_only = "srv_2135_v11118_documents_6"
+    check_true("a row identical across every variation reads as universal",
+               _is_universal(c, 2135, c.by_id[universal]))
+    check_true("...while a one-form row does not",
+               not _is_universal(c, 2135, c.by_id[variant_only]))
+    english = ("Имам доказ за регистрација кој е на англиски јазик. "
+               "Што точно треба да направам со него?")
+    # Two forms contributing `documents` rows is the shape that used to fire, but
+    # one of the two rows is universal, so only ONE form actually has a say.
+    check_true("a universal row does not count as a form disagreeing",
+               _detect_from_evidence(
+                   build_documents(_hits([universal, variant_only]), c),
+                   english, c) is None)
+    check_true("...and a context of only universal rows asks nothing at all",
+               detect_ambiguity(build_documents(_hits([universal]), c),
+                                english, c) is None)
+    # The counterweight, kept adjacent on purpose: the cheap way to pass the
+    # check above is to stop asking about `documents` at all, which breaks this.
+    # Заедница на сопственици and Приватна установа have no electronic-pickup row,
+    # so "електронски или на шалтер" is false for two of the eight forms.
+    pickup = [b.chunk_id for b in c.of_type(2140, "documentsLocations", 11166)][:2]
+    check_true("...but a genuinely variant-specific section still asks",
+               detect_ambiguity(build_documents(_hits(pickup), c),
+                                "Каде можам да го подигнам документот", c)
+               is not None)
+
+    # --- naming a form the service does not have ------------------------- #
+    # This fixture used to use ТП, on the evidence that no service offered it.
+    # That was never true of the REGISTRY -- ТП variations existed all along and
+    # the scraper had silently skipped them, so the test encoded a data gap as
+    # if it were a rule. It now uses ПДОО, which service 2135 offers and 2140
+    # genuinely does not, and asserts ТП in the opposite direction so a
+    # regression in the scrape would be caught here rather than by a user.
+    forms_2140 = [c.variation_name.get((2140, v), "")
+                  for v in c.variations_of.get(2140, ())]
+    check_true("ТП is a real variant of the change service",
+               "ТП" in forms_2140, ", ".join(sorted(forms_2140))[:70])
+    check_true("ПДОО is a form the corpus knows",
+               "ПДОО" in _known_form_names(c))
+    check_true("...but is not a variant of the attributed service",
+               "ПДОО" not in forms_2140)
+    check_true("naming an absent form suppresses the question",
+               _names_absent_form("промена за ПДОО", c, forms_2140))
+    check_true("...while naming a form the service HAS does not",
+               not _names_absent_form("упис на основање на Здружение", c,
+                                      [c.variation_name.get((2140, v), "")
+                                       for v in c.variations_of.get(2140, ())]))
+    check_true("...and naming no form at all does not",
+               not _names_absent_form("Колку чини регистрација?", c,
+                                      [c.variation_name.get((2140, v), "")
+                                       for v in c.variations_of.get(2140, ())]))
+
+    # --- injected rows are context, not evidence -------------------------- #
+    # Structured fetch resolves ONE variation and pastes its whole section in.
+    # Counting those rows made the detector answer a question it had asked
+    # itself: five Фондација `documents` rows arrived by injection, one
+    # Подружница row by search, and it reported that two forms disagreed.
+    fond = [b.chunk_id for b in c.of_type(2135, "documents", 11117)][:4]
+    other = "srv_2135_v11118_documents_6"
+    english = ("Имам доказ за регистрација кој е на англиски јазик. "
+               "Што точно треба да направам со него?")
+    injected = build_documents(_hits(fond + [other]), c, limit=10, pin=fond)
+    check("injected rows are flagged",
+          sum(1 for d in injected if d.injected), len(fond))
+    check_true("a manufactured disagreement is not evidence",
+               _detect_from_evidence(injected, english, c) is None)
+    check_true("...and the same rows retrieved by SEARCH still are",
+               _detect_from_evidence(build_documents(_hits(fond + [other]), c),
+                                     english, c) is not None)
+    # Dedup merges a searched copy into an injected one; the row is then still
+    # evidence, because search did find it.
+    universal = "srv_2135_v11113_documents_1"          # identical to v11117_1
+    merged = build_documents(_hits([fond[0], universal]), c, pin=[fond[0]])
+    check("identical copies collapse to one", len(merged), 1)
+    check_true("a row search also found is not marked injected",
+               not merged[0].injected)
+
+    # --- channels are variants too ---------------------------------------- #
+    # Live: offered "Web сервис" / "Хартиено на шалтер", the user answered
+    # "преку интернет", was asked again, answered "шалтер", and was asked a
+    # third time. The resolver only accepted the registry's own label, so the
+    # menu could not be escaped. And a channel named in the ORIGINAL question
+    # ("како да ја добијам преку интернет") has to scope it without asking.
+    channels = [(1, "Web сервис"), (2, "Хартиено на шалтер")]
+    for reply, want in (("преку интернет", "Web сервис"),
+                        ("онлајн", "Web сервис"),
+                        ("шалтер", "Хартиено на шалтер"),
+                        ("хартиено", "Хартиено на шалтер")):
+        got = match_variation(reply, channels, c)
+        check(f"a menu reply of {reply!r} resolves", got[1] if got else None, want)
+    check_true("an unrelated reply still resolves to nothing",
+               match_variation("АД", channels, c) is None)
+
+    # People punctuate these abbreviations; the registry never does. Latin
+    # spellings matter too -- Macedonian keyboards are not universal.
+    forms_menu = [(11113, "АД"), (11111, "ДОО, ДООЕЛ"), (11112, "ТП")]
+    for reply, want in (("а.д.", "АД"), ("a.d.", "АД"), ("ad", "АД"),
+                        ("д.о.о.", "ДОО, ДООЕЛ"), ("doo", "ДОО, ДООЕЛ"),
+                        ("dooel", "ДОО, ДООЕЛ"), ("тп", "ТП"), ("tp", "ТП")):
+        got = match_variation(reply, forms_menu, c)
+        check(f"punctuated/latin {reply!r} resolves", got[1] if got else None, want)
+    check("...and a dotted form is recognised up front",
+          named_forms("Колку чини упис за а.д.?", c), ["АД"])
+    # Scoped to single-letter runs so it cannot mangle a real dotted string.
+    check("collapsing leaves URLs alone",
+          _collapse_dotted("линк: e-submit.crm.com.mk"), "линк: e-submit.crm.com.mk")
+    check_true("a channel named up front is recognised",
+               "Web сервис" in named_forms(
+                   "Ми треба тековна состојба. Како да ја добијам преку интернет?", c))
+    check("...and an ordinary question names no form",
+          named_forms("Колку чини регистрација?", c), [])
+
+    # --- targeted vs enumerative ------------------------------------------ #
+    check_true("a pointed question is targeted", _is_targeted(english))
+    check_true("...and a list question is not",
+               not _is_targeted("Кои документи ми требаат за да регистрирам фирма?"))
+    check_true("'каде' asks for a set, not one row",
+               not _is_targeted("Каде можам да го подигнам документот"))
+
     xml = render_ambiguity(detect_ambiguity(docs, "Колку чини регистрација?", c))
     check_true("prompt warns the rows may be absent from the context",
                "may contain none of them" in xml)
@@ -290,10 +420,12 @@ def _clarification_tests(c) -> None:
     spelled = match_variation("а колку е за акционерско друштво", amb.variations, c)
     check_true("spelled-out legal form resolves via the glossary",
                spelled is not None and spelled[1] == "АД", str(spelled))
-    # "ПДОО" is the label; nobody asks for a ПДОО, they ask for a ДОО.
-    pdoo = match_variation("ме интересира ДОО", amb.variations, c)
-    check_true("ДОО resolves to the ПДОО variation",
-               pdoo is not None and pdoo[1] == "ПДОО", str(pdoo))
+    # ПДОО ("Поедноставено ДОО") is a SIMPLIFIED fast-track and a different
+    # procedure. While the real "ДОО, ДООЕЛ" variation was missing from the
+    # corpus, "доо" landed on ПДОО and this fixture asserted that as correct.
+    doo = match_variation("ме интересира ДОО", amb.variations, c)
+    check_true("ДОО resolves to its OWN variation, not the simplified one",
+               doo is not None and doo[1] == "ДОО, ДООЕЛ", str(doo))
 
     print("[follow-up detection]")
     check_true("discourse opener marks a follow-up",
@@ -324,15 +456,16 @@ def _orchestration_tests(c) -> None:
 
     a1 = agent.ask("Колку чини регистрација?")
     check_true("turn 1 detects ambiguity", a1.asked_for_clarification)
-    check_true("turn 1 sends system rules first",
-               client.calls[0][0]["role"] == "system"
-               and "ALWAYS respond in Macedonian" in client.calls[0][0]["content"])
-    check_true("documents go in their own system message",
-               any(m["role"] == "system" and "<documents>" in m["content"]
-                   for m in client.calls[0][1:]))
-    check_true("the user turn is last", client.calls[0][-1]["role"] == "user")
-    check("cost is accounted", round(a1.cost_usd, 8),
-          round((100 * 0.15 + 20 * 0.60) / 1_000_000, 8))
+    # GATE 3 is structural: an ambiguous turn never reaches the model, so there
+    # is no answer, no coverage hedge and no menu-under-an-answer to leak. Live,
+    # the model produced all three at once -- a hallucinated document list, a
+    # hedge saying the list was incomplete, and the options underneath.
+    check("an ambiguous turn does not call the model", len(client.calls), 0)
+    check("...so it costs nothing", a1.cost_usd, 0.0)
+    check("...and cites nothing", a1.citations, [])
+    check_true("...and the reply is the question itself",
+               a1.text.startswith("За каква правна форма") and "- АД" in a1.text,
+               a1.text.splitlines()[0])
 
     # Turn 2: the reply alone ("АД") is meaningless as a query -- it must be
     # combined with the original question and turned into a filter.
@@ -343,8 +476,25 @@ def _orchestration_tests(c) -> None:
                "Колку чини регистрација?" in q2 and "АД" in q2, q2)
     check("clarification becomes a variation filter",
           (f2 or {}).get("variation_scope") is not None, True)
+    # The service was settled when we asked; the reply only picks a form. Live,
+    # answering "АД" to a clarification about вистински сопственик (2183) sent
+    # the search after "АД" on its own and returned incorporation-of-AD (2140).
+    check("...and pins the service we asked about", (f2 or {}).get("service_scope"), 2135)
     check_true("resolved turn is no longer ambiguous", not a2.asked_for_clarification)
     check("history carries both turns", len(agent.history), 4)
+    # The message shape is asserted on the first turn that actually calls the model.
+    check_true("system rules go first",
+               client.calls[0][0]["role"] == "system"
+               and "ALWAYS respond in Macedonian" in client.calls[0][0]["content"])
+    check_true("documents go in their own system message",
+               any(m["role"] == "system" and "<documents>" in m["content"]
+                   for m in client.calls[0][1:]))
+    check_true("the user turn is last", client.calls[0][-1]["role"] == "user")
+    # Priced from the table for whichever model is the default, so switching it
+    # is a one-line change and not a test edit as well.
+    in_price, out_price = PRICING[agent.model]
+    check("cost is accounted", round(a2.cost_usd, 8),
+          round((100 * in_price + 20 * out_price) / 1_000_000, 8))
 
     # A long answer must not survive into history as a data source. Live, a
     # 36-agent list from turn 1 was still there six turns later and the model
@@ -378,9 +528,13 @@ def _orchestration_tests(c) -> None:
     a = agent2.ask("Колку чини регистрација?")
     check_true("live-failure query now asks for clarification",
                a.asked_for_clarification and a.ambiguity.source == "structure")
-    check_true("the model is told the forms and that rows may be missing",
-               any("<ambiguity>" in m["content"] and "may contain none of them"
-                   in m["content"] for m in client2.calls[0] if m["role"] == "system"))
+    # The structure detector fires precisely when the differing rows may be
+    # absent from the context, so there is nothing to answer from and the model
+    # is not asked. The user still gets every form to choose between.
+    check("the structure-detected turn does not call the model", len(client2.calls), 0)
+    check_true("...and every legal form is offered",
+               all(f"- {lbl}" in a.text for lbl in ("Здружение", "Фондација")),
+               a.text.replace("\n", " ")[:90])
     # And the follow-up still resolves to a filtered retrieval.
     client2.reply = "Тарифата е 0 МКД [srv_2135_v11113_tariffs_1]."
     a2 = agent2.ask("АД")
@@ -496,6 +650,36 @@ def _structured_fetch_tests(c) -> None:
                any("дел 1 од" in b.content and str(b.n_agents) in b.content
                    for b in centar),
                f"{len(centar)} parts, {centar[0].n_agents} agents")
+
+    # A fetched section must survive the trim to k distinct documents. Live,
+    # five of six pledge-deletion steps reached the model and it correctly
+    # reported that one was missing -- the section was fetched whole and then
+    # cut apart by semantic competition in the fused ranking.
+    steps = [b.chunk_id for b in c.of_type(2115, "process", 11125)]
+    noise = [b.chunk_id for b in c.by_service[2183]][:5]
+    interleaved = _hits([steps[0], noise[0], steps[1], noise[1], steps[2],
+                         noise[2], steps[3], noise[3], steps[4], noise[4],
+                         steps[5]])
+    # limit=10 is what the agent actually uses (DEFAULT_K), and at that size this
+    # fixture reproduces the live failure exactly: five of the six steps arrive.
+    plain = build_documents(interleaved, c, limit=10)
+    kept = build_documents(interleaved, c, limit=10, pin=steps)
+    check("without pinning the section tail is trimmed away",
+          sum(1 for d in plain if d.chunk_id in steps), 5)
+    check("pinning keeps every fetched row",
+          sum(1 for d in kept if d.chunk_id in steps), len(steps))
+    check("...without exceeding the limit", len(kept), 10)
+    # ...but injection can never take the whole context: the semantic arm is
+    # what recovers a wrong attribution.
+    flood = [b.chunk_id for b in c.of_type(2135, "documents", 11117)][:12]
+    crowded = build_documents(_hits(flood + noise), c, limit=10, pin=flood)
+    check("injection leaves room for the semantic arm",
+          sum(1 for d in crowded if d.chunk_id not in set(flood)), 3)
+    # Rank order across sections, registry order WITHIN one. Sorting purely by
+    # fused rank handed the model a numbered procedure as 4, 1, 5, 2, 3, and it
+    # answered 1, 2, 4, 5 -- losing a step while reassembling the sequence.
+    check("a procedure reads in its own order",
+          [d.chunk_id for d in kept if d.chunk_id in steps], steps)
 
     # The budget keeps injection from taking every slot at small k.
     r.search("Кои документи се потребни?", 10)

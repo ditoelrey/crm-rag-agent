@@ -41,6 +41,7 @@ from eval.corpus import Block, Corpus
 from eval.corpus import load as load_corpus
 from eval.retriever import Hit
 
+from .agent import DEFAULT_MODEL
 from .context import build_documents, render_documents, validate_citations
 
 
@@ -218,9 +219,9 @@ class BehaviouralResult:
     answer: str = ""
 
 
-def check_behavioural(corpus: Corpus, *, model: str = "gpt-4o-mini"
+def check_behavioural(corpus: Corpus, *, model: str = DEFAULT_MODEL
                       ) -> list[BehaviouralResult]:
-    from .agent import CRMAgent
+    from .agent import DEFAULT_MODEL, CRMAgent
 
     real = next(b.chunk_id for b in corpus
                 if b.type == "tariffs" and b.chunk_id != POISON_ID)
@@ -253,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--live", action="store_true",
                    help="also ask the model (one call per payload, ~$0.002)")
-    p.add_argument("--model", default="gpt-4o-mini")
+    p.add_argument("--model", default=DEFAULT_MODEL)
     args = p.parse_args(argv)
 
     corpus = load_corpus()

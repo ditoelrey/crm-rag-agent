@@ -72,7 +72,39 @@ _GLOSSARY_RE = re.compile(
 # asking about the ПДОО variation, and would never recognise "ПДОО" in a list of
 # options. This one cannot be derived; it comes from the tariff description.
 FORM_EXTRA_SYNONYMS: dict[str, tuple[str, ...]] = {
-    "ПДОО": ("ДОО", "ДООЕЛ", "друштво со ограничена одговорност"),
+    # ПДОО is "Поедноставено ДОО", a SIMPLIFIED fast-track incorporation, and it
+    # is a different procedure from an ordinary ДОО. It used to carry ДОО/ДООЕЛ
+    # as synonyms because the real "ДОО, ДООЕЛ" variation was missing from the
+    # corpus -- 102 of 217 variations were never fetched -- so "доо" had nowhere
+    # else to land. It has somewhere now, and sending an ordinary ДОО down the
+    # simplified track would be a wrong answer, not a near miss.
+    "ПДОО": ("поедноставено доо", "pdoo"),
+    "ДОО, ДООЕЛ": ("друштво со ограничена одговорност", "doo", "dooel"),
+    # Latin spellings: Macedonian keyboards are not universal and these
+    # abbreviations get typed in Latin constantly.
+    "АД": ("ad", "a.d.", "акционерско друштво"),
+    "ТП": ("tp", "трговец поединец"),
+}
+
+# Not every variant is a legal form: some are the CHANNEL you use the service
+# through. These labels are the registry's, and nobody types them -- a user says
+# "преку интернет" or "на шалтер". Asked to choose between "Web сервис" and
+# "Хартиено на шалтер", a live session answered "преку интернет", was asked
+# again, answered "шалтер", and was asked a third time: the resolver only
+# accepted the label verbatim, so the menu could not be got out of.
+#
+# The glossary cannot supply these -- it expands abbreviations, and these are
+# not abbreviations of anything. Note "шалтер" appears here as a variant name
+# while intent.py deliberately excludes it as a section cue; the two uses do not
+# conflict, because this one only ever runs against a known list of variants.
+CHANNEL_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "Електронски": ("интернет", "преку интернет", "онлајн", "електронски",
+                    "по електронски пат", "дигитално"),
+    "Web сервис": ("интернет", "преку интернет", "онлајн", "веб сервис",
+                   "web", "веб", "апликација"),
+    "Хартиено на шалтер": ("шалтер", "на шалтер", "хартиено", "хартија",
+                           "лично", "во филијала"),
+    "Хартиено": ("хартиено", "хартија", "на хартија", "печатено"),
 }
 
 # Skopje is administratively ten municipalities, and the agent lists file each
@@ -118,6 +150,7 @@ def form_synonyms(label: str, corpus: Corpus) -> tuple[str, ...]:
     if full:
         out.append(full)
     out.extend(FORM_EXTRA_SYNONYMS.get(label.strip(), ()))
+    out.extend(CHANNEL_SYNONYMS.get(label.strip(), ()))
     seen, uniq = set(), []
     for s in out:
         if _norm(s) not in seen and _norm(s) != _norm(label):

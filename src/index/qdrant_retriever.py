@@ -52,9 +52,17 @@ def _to_condition(field: str, value: Any) -> models.FieldCondition:
     return models.FieldCondition(key=field, match=models.MatchValue(value=value))
 
 
+# Filter names the agent speaks -> payload fields the collection actually
+# indexes. "service_scope" is the agent's word for "the service is already
+# decided"; on this side it is just id_service. Without the mapping the dense
+# arm would filter on a key no point carries and quietly return nothing.
+_FIELD_ALIASES = {"service_scope": "id_service"}
+
+
 def to_filter(filters: dict[str, Any] | None) -> models.Filter | None:
     if not filters:
         return None
+    filters = {_FIELD_ALIASES.get(f, f): v for f, v in filters.items()}
     return models.Filter(must=[_to_condition(f, v) for f, v in filters.items()])
 
 

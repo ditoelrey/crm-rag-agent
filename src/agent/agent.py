@@ -31,10 +31,20 @@ from eval.corpus import load as load_corpus
 from eval.retriever import Hit
 
 from .context import (Ambiguity, ContextDoc, _attributed_service, build_context,
+                      _collapse_dotted, _names_absent_form,
+                      clarification_text, named_forms,
                       validate_citations)
 from .prompts import SYSTEM_PROMPT, context_message
 
-DEFAULT_MODEL = "gpt-4o-mini"
+# gpt-4o, chosen on a 20-query A/B against gpt-4o-mini. On the curated suite the
+# gap is one point (0.9974 vs 0.9872) and 4o costs ~13.6x, which on its own would
+# not justify it -- the case for it is made by behaviour the suite does not yet
+# cover. Given documents for a FOREIGN sole trader when the question was about a
+# domestic one, mini answered from them and 4o abstained; same on the tender
+# package when the word "шалтер" pulled in generic counter documents. For a
+# government-facing bot, correctly recognising that retrieved text does not apply
+# is worth more than the cost multiple.
+DEFAULT_MODEL = "gpt-4o"
 DEFAULT_K = 10
 DEFAULT_TEMPERATURE = 0.0
 # The OpenAI SDK defaults to a 600-second timeout; combined with retries a single
@@ -117,6 +127,15 @@ class Answer:
         return [d for d in self.docs if d.chunk_id in cited]
 
 
+# An answer that cites nothing must SAY it has nothing. These are the phrasings
+# that count as saying so; anything else with no citation is replaced outright.
+_ABSTAIN_MARKERS = ("нема информација", "немам информација", "не располагам",
+                    "не постои информација", "не е наведено", "нема податоци",
+                    "не можам да", "не се наведени")
+HARD_ABSTENTION = ("Во документацијата со која располагам нема информација "
+                   "за ова прашање.")
+
+
 def _norm(text: str) -> str:
     return unicodedata.normalize("NFKC", text).casefold()
 
@@ -128,6 +147,12 @@ def _for_history(text: str) -> str:
     kept = text[:HISTORY_ANSWER_CHARS].rsplit("\n", 1)[0]
     return kept + ("\n[... остатокот од претходниот одговор не е достапен во "
                    "овој чекор; податоците мора повторно да се побараат ...]")
+
+
+def _carries_subject(message: str, corpus: Corpus) -> bool:
+    """Does this message name something to be about? See index.structured."""
+    from index.structured import subject_anchors
+    return bool(subject_anchors(message, corpus))
 
 
 def is_followup(message: str) -> bool:
@@ -156,7 +181,7 @@ def match_variation(reply: str, candidates: Sequence[tuple[int, str]],
     Short labels are matched on word boundaries -- a substring test fires on
     "адреса" or "склад" and would silently filter the search to the wrong form.
     """
-    r = _norm(reply)
+    r = _norm(_collapse_dotted(reply))
     for vid, label in candidates:
         forms = [label]
         if corpus is not None:
@@ -167,8 +192,17 @@ def match_variation(reply: str, candidates: Sequence[tuple[int, str]],
             if len(f) <= 5:
                 if re.search(rf"(?<!\w){re.escape(f)}(?!\w)", r):
                     return vid, label
-            elif f in r or any(part in r for part in f.split(", ") if len(part) > 3):
+            elif f in r:
                 return vid, label
+            else:
+                # Comma-listed labels name several forms at once ("ДОО, ДООЕЛ").
+                # Each part is matched on a word boundary rather than by
+                # substring: the old length guard required 4+ characters, so a
+                # user replying "доо" -- three -- matched nothing and the menu
+                # looped, while "дооел" resolved fine.
+                for part in (p.strip() for p in f.split(",")):
+                    if len(part) > 1 and re.search(rf"(?<!\w){re.escape(part)}(?!\w)", r):
+                        return vid, label
     return None
 
 
@@ -227,11 +261,33 @@ class CRMAgent:
              back with two documents and lost the tariff row entirely;
           3. a self-contained question -> use as-is; it becomes the topic.
         """
+        self._reply_named_absent = False
         if self._pending is not None:
             question, amb = self._pending
             matched = match_variation(message, amb.variations, self.corpus)
             query = f"{question} {message}".strip()
-            return (query, {"variation_scope": matched[0]}) if matched else (query, None)
+            if not matched:
+                # They answered with a form this service does not offer. Showing
+                # the same menu again cannot help -- it is the one reply that
+                # carries no new information. Note "ТП" reaches here on purpose:
+                # the corpus has no domestic sole-trader variation, and its only
+                # ТП label is "Подружница на странско друштво и странски ТП", a
+                # FOREIGN branch. Quietly resolving to that would route someone
+                # opening a local shop into the wrong service entirely.
+                self._reply_named_absent = _names_absent_form(
+                    message, self.corpus, [lbl for _, lbl in amb.variations])
+            if matched:
+                # The SERVICE is already settled -- it is the one we asked about.
+                # Scoping only the variation let the merged query go shopping:
+                # asked which legal form for "вистински сопственик" (2183) and
+                # answered "АД", the search took "АД" at face value and returned
+                # the incorporation-of-AD service (2140), so the user got correct
+                # instructions for a procedure they had not asked about. A reply
+                # to our own menu narrows the established topic; it is not a new
+                # question.
+                return query, {"service_scope": amb.id_service,
+                               "variation_scope": matched[0]}
+            return query, None
 
         # NOTE: `_topic` is the PREVIOUS user message, not the last
         # self-contained one. A follow-up can change the subject -- "А во
@@ -239,11 +295,29 @@ class CRMAgent:
         # municipality -- and anchoring on the last self-contained question
         # meant a third turn reached back past it. Observed: turn 3 asked for
         # examples of the Струмица agents just listed and retrieved Гостивар.
-        if self._topic and is_followup(message):
+        # A message that names no subject is a continuation whatever its length.
+        # "колку се плаќа и како се плаќа, преку кои" is eight tokens with no
+        # discourse opener and no anaphor, so the shape-based test called it a
+        # new question -- and it retrieved on a query that says only what the
+        # user wants to know, never what about, landing on an unrelated service.
+        # In a conversation, "how much is it" means "how much is THIS".
+        if self._topic and (is_followup(message)
+                            or not _carries_subject(message, self.corpus)):
             query = f"{self._topic} {message}".strip()
             forms = self._forms_of(self._last_service)
             matched = match_variation(message, forms, self.corpus) if forms else None
             return (query, {"variation_scope": matched[0]}) if matched else (query, None)
+
+        # A self-contained question that NAMES its legal form scopes to it. Rows
+        # belonging to a different form cannot answer it, and left in the pool
+        # they win on semantic similarity -- "кои се потребните документи за да
+        # регистрирам доо" filled all ten slots with Фондација documents. Rows
+        # with no form of their own (descriptions, FAQs, shared terminology) are
+        # kept: they apply to every form, and dropping them would leave nothing
+        # to answer from.
+        forms = named_forms(message, self.corpus)
+        if forms:
+            return message, {"form_scope": forms}
 
         return message, None
 
@@ -258,6 +332,25 @@ class CRMAgent:
         return list(self.retriever.search(query, self.k * OVERFETCH, filters=filters))
 
     # -- generation -------------------------------------------------------- #
+    def _clarify(self, message: str, amb: Ambiguity, docs: list[ContextDoc],
+                 retrieval_ms: float) -> Answer:
+        """Ask which variant, deterministically. No model call, so nothing leaks."""
+        text = clarification_text(amb, self.corpus)
+        if getattr(self, "_reply_named_absent", False):
+            text = ("Формата што ја наведовте не е меѓу формите достапни за оваа "
+                    "услуга. Достапни се следниве:\n\n"
+                    + text.split("\n\n", 1)[-1])
+        self.history.append({"role": "user", "content": message})
+        self.history.append({"role": "assistant", "content": text})
+        self._pending = ((self._pending[0] if self._pending else message), amb)
+        self._last_service = amb.id_service
+        self.seen_docs.update(d.chunk_id for d in docs)
+        return Answer(query=message, text=text, docs=docs, citations=[],
+                      stale_citations=[], invalid_citations=[], ambiguity=amb,
+                      retrieval_query=message, filters=None, model=self.model,
+                      prompt_tokens=0, completion_tokens=0, cost_usd=0.0,
+                      retrieval_ms=retrieval_ms, generation_ms=0.0)
+
     def ask(self, message: str) -> Answer:
         retrieval_query, filters = self._plan_retrieval(message)
 
@@ -265,12 +358,24 @@ class CRMAgent:
         hits = self.retrieve(retrieval_query, filters)
         retrieval_ms = (time.perf_counter() - t0) * 1000
 
+        # Rows structured fetch deliberately injected must survive the trim to
+        # k distinct documents -- otherwise a section is fetched whole and then
+        # cut apart by semantic competition (see build_documents).
+        pinned = list(getattr(self.retriever, "last_sections", ()) or ())
         context_xml, docs, amb = build_context(hits, self.corpus, retrieval_query,
-                                               dedup=self.dedup, limit=self.k)
+                                               dedup=self.dedup, limit=self.k,
+                                               pin=pinned)
         # A clarification already resolved to one legal form is not ambiguous
         # any more, even if shared blocks still mention siblings.
         if filters and "variation_scope" in filters:
             amb = None
+
+        # GATE 3, enforced rather than requested. When the choice is real the
+        # clarification IS the reply, so we write it and never call the model --
+        # there is no answer, no coverage hedge and no menu-underneath-an-answer,
+        # because no model output exists to leak. Also saves a call.
+        if amb is not None:
+            return self._clarify(message, amb, docs, retrieval_ms)
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages += self.history[-MAX_HISTORY_TURNS * 2:]
@@ -284,6 +389,18 @@ class CRMAgent:
 
         text = (resp.choices[0].message.content or "").strip()
         valid, stale, invalid = validate_citations(text, docs, self.seen_docs)
+
+        # HARD ABSTENTION. Every factual sentence must carry a citation, so an
+        # answer with no valid one is either an abstention (fine) or ungrounded.
+        # Observed live: asked which documents a ДОО needs, the context held ten
+        # rows -- all Фондација -- and rather than say so the model fell back on
+        # pre-trained knowledge and listed "Статут" and "Програма за дејствување",
+        # which belong to other legal forms. Nothing in the answer was citable,
+        # and the citation count said 0/10 while the text read as authoritative.
+        # A prompt rule did not prevent this and cannot; the check is structural.
+        if not valid and not any(m in _norm(text) for m in _ABSTAIN_MARKERS):
+            text = HARD_ABSTENTION
+            stale, invalid = [], []
         self.seen_docs.update(d.chunk_id for d in docs)
 
         usage = getattr(resp, "usage", None)
@@ -297,7 +414,14 @@ class CRMAgent:
         self.history.append({"role": "assistant", "content": _for_history(text)})
         # Remember what we asked about, so the next message can be read as a reply.
         self._pending = ((self._pending[0] if self._pending else message), amb) if amb else None
-        if self._pending is None:
+        if self._pending is None and (self._topic is None
+                                      or _carries_subject(message, self.corpus)):
+            # Only a message that names a SUBJECT may become the topic. Live,
+            # "колку се плаќа и како се плаќа" carried none -- it says what the
+            # user wants to know, not what about -- yet it replaced the topic,
+            # and the next follow-up merged with nothing and landed on an
+            # unrelated service. A subject-free turn now leaves the topic alone,
+            # so the thread survives a run of contextless questions.
             self._topic = message
         self._last_service = (amb.id_service if amb else
                               _attributed_service(docs) or self._last_service)

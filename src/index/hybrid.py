@@ -48,12 +48,19 @@ class HybridRetriever:
     def search(self, query: str, k: int = 10, *,
                filters: dict[str, Any] | None = None) -> list[Hit]:
         lex = self.lexical.search(query, self.depth)
-        vec = self.dense.search(query, self.depth, filters=filters)
+        # `form_scope` is an OR ("this legal form, or text that applies to every
+        # form"), which the payload filter builder only expresses as AND. Keeping
+        # it out of the dense query and applying it to both arms afterwards costs
+        # one pass and avoids teaching to_filter() about should-clauses.
+        dense_filters = ({f: v for f, v in filters.items() if f not in _POST_ONLY}
+                         if filters else None)
+        vec = self.dense.search(query, self.depth, filters=dense_filters or None)
 
         if filters:
             # BM25 has no payload filter, so apply the same predicate to its arm
             # rather than letting unfiltered lexical hits leak into the fusion.
             lex = [h for h in lex if _matches(self.corpus.by_id[h.chunk_id], filters)]
+            vec = [h for h in vec if _matches(self.corpus.by_id[h.chunk_id], filters)]
 
         scores: dict[str, float] = {}
         for arm, weight in ((lex, self.w_lex), (vec, self.w_vec)):
@@ -66,11 +73,29 @@ class HybridRetriever:
         self.dense.close()
 
 
+# Filters applied after the dense query rather than inside it.
+_POST_ONLY = ("form_scope",)
+
+
 def _matches(block, filters: dict[str, Any]) -> bool:
     for field, want in filters.items():
+        if field == "form_scope":
+            # The named legal form, OR anything that is not form-specific.
+            # Service descriptions, FAQs and shared terminology carry no
+            # variation and apply to every form, so excluding them would strip
+            # the context needed to answer at all.
+            label = block.variation_short_name
+            if label and label not in (want if isinstance(want, (list, tuple, set))
+                                       else [want]):
+                return False
+            continue
         if field == "variation_scope":
             have: Any = (list(block.applies_to_variations) if block.is_shared
                          else ([block.id_variation] if block.id_variation else []))
+        elif field == "service_scope":
+            # Set only when the user is answering a clarification WE asked, so
+            # the service is already decided and the reply just picks a form.
+            have = block.id_service
         else:
             have = getattr(block, field, None)
         wanted = want if isinstance(want, (list, tuple, set)) else [want]

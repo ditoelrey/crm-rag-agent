@@ -53,13 +53,63 @@ def normalize(text: str) -> str:
     return unicodedata.normalize("NFKC", text).lower()
 
 
-def stem(token: str) -> str:
-    """Strip one MK inflectional suffix (definite article / plural / gender).
+# DERIVATIONAL suffixes: they turn a verb into its action noun, or the other way
+# round. The registry writes nouns ("бришење", "ликвидација", "поднесување");
+# users write verbs ("избришам", "ликвидирам", "поднесам"). Without this the
+# lexical arm contributes NOTHING to a question phrased as a verb -- measured
+# live three times: ликвидирам/ликвидација, избришам/бришење, and a "Сакам да
+# избришам залог" that retrieved zero blocks of the pledge-deletion service.
+#
+# These run BEFORE the inflectional pass, on the raw token. Order matters:
+# "ликвидација" inflects to "ликвидаци" first, and no derivational rule would
+# ever see the "ација" it needs.
+#
+# Longest first; min_len keeps a short root from being gutted.
+#
+# Measured, not assumed. Each family was A/B'd alone and in combination on the
+# 544-case harness (lexical arm, ndcg@10, baseline 0.7568):
+#
+#     -ација / -ирање         +0.0014
+#     -ување                  +0.0013
+#     ^^ the two above, together:       0.7595  (+0.0027)   <-- kept
+#     -ење / -ање             -0.0026
+#     -ам                     -0.0024
+#     -ирам                   +0.0000   (rejected -- see below)
+#
+# On the full stack (struct+alias+hybrid) the same pair is +0.0017 ndcg@10
+# (0.8110 -> 0.8128), and variation_acc@1 +0.0063 (0.8994 -> 0.9057).
+#
+# -ење/-ање/-ам collapse variation_documents 0.849 -> 0.715 and terminology
+# 0.664 -> 0.625: they are short and productive enough to erode the IDF of the
+# registry's own discriminative nouns. So "бришам"/"бришење" still do NOT merge
+# here; that pair belongs query-side in index/aliases.py, which can only ADD
+# candidates via RRF and never reweights the index.
+#
+# -ирам was tried and rejected even though it looks like the natural partner of
+# -ација. It is free on the harness but not free in the system: it folds the verb
+# "регистрирам" (df=3, inert) onto "регистр" (df=187), which then out-votes the
+# real subject in subject_anchors() -- "Како да регистрирам залог?" was attributed
+# to Фондација instead of the pledge service. Caught by agent.selftest. The
+# compensating fix (marking "регистр" generic) breaks the opposite case, where it
+# is the whole subject: "Колку чини регистрација?".
+_DERIVATIONAL: tuple[tuple[str, int], ...] = (
+    ("ирање", 8), ("ување", 8), ("ација", 7),
+)
 
-    Single-pass and conservative on purpose: a second pass would merge
-    "регистар"/"регистрација" style pairs that a legal-answer system should
-    keep apart.
+
+def stem(token: str) -> str:
+    """Strip one derivational and then one inflectional MK suffix.
+
+    Still conservative: at most one suffix from each list, never below the
+    minimum length, and no prefix handling -- "избришам" keeps its "из-", so it
+    does not merge with "бришење". Verb prefixes in Macedonian change meaning
+    often enough (јава / изјава) that stripping them would merge words a
+    legal-answer system must keep apart.
     """
+    for suf, min_len in _DERIVATIONAL:
+        if len(token) >= min_len and token.endswith(suf):
+            token = token[: -len(suf)]
+            break
     for suf, min_len in _SUFFIXES:
         if len(token) >= min_len and token.endswith(suf):
             return token[: -len(suf)]

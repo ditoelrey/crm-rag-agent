@@ -20,6 +20,8 @@ then `--retriever index.dense:build`. Nothing in the harness changes.
 from __future__ import annotations
 
 import argparse
+
+from agent.agent import DEFAULT_MODEL as AGENT_DEFAULT_MODEL
 import importlib
 import os
 import sys
@@ -363,7 +365,9 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--exclude-leaky", action="store_true")
     a.add_argument("--limit", type=int)
     a.add_argument("--seed", type=int, default=20260728)
-    a.add_argument("--model", default="gpt-4o-mini")
+    # Follows the agent's default so the eval measures what ships; a copy
+    # here silently kept scoring gpt-4o-mini after the default changed.
+    a.add_argument("--model", default=AGENT_DEFAULT_MODEL)
     a.add_argument("-k", type=int, default=10)
     a.add_argument("--tag", default="answers")
     a.add_argument("--timeout", type=float, default=120.0,

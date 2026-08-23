@@ -253,12 +253,43 @@ def value_recall(record: AnswerRecord, case: EvalCase) -> float | None:
     return found / len(case.expect_values)
 
 
+def _states_unnegated(text: str, needle: str) -> bool:
+    """Is `needle` present at least once WITHOUT a preceding "не"?
+
+    Forbidding a claim means forbidding the assertion, not the words. Macedonian
+    negates by placing "не" directly before the verb, so the forbidden phrase is
+    a literal substring of its own denial: an answer that correctly says "агентот
+    НЕ може да ви ја среди документацијата" contains "може да ви ја среди". The
+    first version of this check scored exactly that answer 0.0 -- marking the
+    model wrong for finally getting it right.
+
+    Every occurrence is examined, so "агентот може ..., но не може ..." still
+    trips on the first, unnegated one.
+    """
+    start = 0
+    while (i := text.find(needle, start)) >= 0:
+        before = text[:i].rstrip()
+        if not (before.endswith("не") and (len(before) == 2 or not before[-3].isalpha())):
+            return True
+        start = i + 1
+    return False
+
+
 def forbidden_absent(record: AnswerRecord, case: EvalCase) -> float | None:
-    """1.0 when no near-miss value appears. The wrong fee is a real fee."""
+    """1.0 when no near-miss value appears. The wrong fee is a real fee.
+
+    Like `value_recall`, an entry may list equivalent phrasings separated by
+    "|", and ANY of them trips it. Without this the field only catches wording
+    it was written against: the NGO false-premise case forbade "агентот може"
+    and happily passed an answer that said "регистрационен агент може да ви
+    помогне" -- the same false claim, scored 0.75.
+    """
     if not case.forbid_values:
         return None
     text = _norm(record.text)
-    return 0.0 if any(_norm(v) in text for v in case.forbid_values) else 1.0
+    return 0.0 if any(_states_unnegated(text, _norm(alt))
+                      for v in case.forbid_values
+                      for alt in v.split("|")) else 1.0
 
 
 def numbers_in(text: str) -> list[str]:

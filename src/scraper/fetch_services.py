@@ -376,10 +376,62 @@ async def crawl(cfg: Config) -> None:
         # ---------------- HOP 3: service (+ variations) ----------------
         log.info("HOP 3: fetching service payloads ...")
 
+        async def do_variations(sid: int, cid: int, variations: list[int]) -> None:
+            """Fetch every variation of a service that is not already archived."""
+            for vid in variations:
+                vkey = f"{sid}_v{vid}_L{cfg.language}"
+                if vkey in manifest.done:
+                    continue
+                async with sem:
+                    try:
+                        vst, vbd = await fetch_raw(client, url_service(cfg, sid, cid, vid),
+                                                   cfg, throttle)
+                    except Exception as e:
+                        log.error("variation %s/%s failed: %s", sid, vid, e)
+                        stats["failed"] += 1
+                        manifest.write({"kind": "variation", "key": vkey, "id_service": sid,
+                                        "id_variation": vid, "status": "failed",
+                                        "error": str(e)})
+                        continue
+                archive(cfg.out_dir, vkey, vbd)
+                manifest.write({"kind": "variation", "key": vkey, "id_service": sid,
+                                "id_variation": vid, "id_category": cid,
+                                "status": "ok" if vst == 200 and not is_soft_error(vbd) else "error",
+                                "http_status": vst, "bytes": len(vbd), "sha256": sha(vbd)})
+                stats["variations"] += 1
+                log.info("    variation %s/%s (%d bytes)", sid, vid, len(vbd))
+
         async def do_service(ref: dict[str, Any]) -> None:
             sid, cid = ref["id_service"], ref["id_category"]
             key = f"{sid}_L{cfg.language}"
             if key in manifest.done:
+                # RESUME. Returning here used to skip the service's variations
+                # along with the service, which is how a run interrupted after
+                # hop 3 lost them permanently: on the next run the service was
+                # "done", so nothing under it was ever fetched again. It cost 102
+                # of 217 variations -- including "ДОО, ДООЕЛ" and "ТП" on every
+                # core registry service -- and no error was recorded anywhere,
+                # because nothing failed. It simply never asked.
+                #
+                # The payload is already on disk, so the variation ids can be
+                # re-read without another request; do_variations() then skips
+                # whichever ones are genuinely archived.
+                if cfg.skip_variations:
+                    return
+                path = cfg.out_dir / f"{key}.json"
+                try:
+                    body = path.read_bytes()
+                    variations = harvest_variation_ids(
+                        loads_tolerant(body.decode("utf-8", "replace")))
+                except Exception as e:
+                    log.warning("service %s: cannot re-read archived payload (%s)", sid, e)
+                    return
+                pending = [v for v in variations
+                           if f"{sid}_v{v}_L{cfg.language}" not in manifest.done]
+                if pending:
+                    log.info("  service %-6s resumed: %d variation(s) still missing",
+                             sid, len(pending))
+                await do_variations(sid, cid, variations)
                 return
             async with sem:
                 try:
@@ -409,27 +461,7 @@ async def crawl(cfg: Config) -> None:
             if cfg.skip_variations:
                 return
             # variations are query params on THIS service, not separate services
-            for vid in variations:
-                vkey = f"{sid}_v{vid}_L{cfg.language}"
-                if vkey in manifest.done:
-                    continue
-                async with sem:
-                    try:
-                        vst, vbd = await fetch_raw(client, url_service(cfg, sid, cid, vid),
-                                                   cfg, throttle)
-                    except Exception as e:
-                        log.error("variation %s/%s failed: %s", sid, vid, e)
-                        stats["failed"] += 1
-                        manifest.write({"kind": "variation", "key": vkey, "id_service": sid,
-                                        "id_variation": vid, "status": "failed", "error": str(e)})
-                        continue
-                archive(cfg.out_dir, vkey, vbd)
-                manifest.write({"kind": "variation", "key": vkey, "id_service": sid,
-                                "id_variation": vid, "id_category": cid,
-                                "status": "ok" if vst == 200 and not is_soft_error(vbd) else "error",
-                                "http_status": vst, "bytes": len(vbd), "sha256": sha(vbd)})
-                stats["variations"] += 1
-                log.info("    variation %s/%s (%d bytes)", sid, vid, len(vbd))
+            await do_variations(sid, cid, variations)
 
         await asyncio.gather(*(do_service(r) for r in service_refs))
 

@@ -20,8 +20,15 @@ import unicodedata
 INTENT_CUES: dict[str, tuple[str, ...]] = {
     "documentsLocations": ("подигн", "преземањ", "презем", "подига"),
     "forms": ("образец", "обрасц", "формулар"),
+    # "колку се плаќа" is a compound cue on purpose. Macedonian splits payment
+    # across two stems -- плати/платам and плаќа/плаќање -- and the SECTION
+    # depends on the interrogative, not the verb: "колку се плаќа" wants the
+    # tariff, "како се плаќа" wants the payment methods in `access`. Live, a
+    # question that was entirely about payment matched neither cue list ("плаќа"
+    # falls between "плати" and "плаќањ") and routed to `process` on the
+    # strength of "како" alone.
     "tariffs": ("чин", "цена", "цени", "тариф", "надомест", "кошта", "плати",
-                "чинат", "пари"),
+                "чинат", "пари", "колку се плаќа", "колку плаќ"),
     "deadlines": ("рок", "колку време", "трае", "траење"),
     # "поднесе" was here to catch "Што треба да поднесам за X?" and fired on the
     # ordinary passive "да се поднесе" instead -- it turned "Дали годишна сметка
@@ -34,7 +41,7 @@ INTENT_CUES: dict[str, tuple[str, ...]] = {
     # subject word in "кои се ЧЕКОРИТЕ ... преку шалтер" and routed a procedure
     # question to `access`. Pickup questions still reach documentsLocations via
     # "подигн"; genuine access questions via онлајн / интернет / електронск.
-    "access": ("онлајн", "интернет", "електронск", "плаќањ"),
+    "access": ("онлајн", "интернет", "електронск", "плаќ", "плат"),
     # "пријав" is deliberately absent: it is a NOUN in dozens of service names
     # ("Самостојна пријава за упис на основање"), so it fired on questions that
     # merely named a service and injected its procedure over the description.

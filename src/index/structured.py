@@ -46,7 +46,7 @@ from eval.corpus import Corpus
 from eval.corpus import load as load_corpus
 from eval.retriever import Hit
 
-from .intent import detect_intent
+from .intent import INTENT_CUES, detect_intent
 
 # Sections are small: process maxes at 8 rows, tariffs 14, deadlines 7, forms 10,
 # documentsLocations 3 -- so a whole section fits comfortably. Only `documents`
@@ -60,14 +60,72 @@ def _norm(text: str) -> str:
 
 
 # Interrogatives and filler carry no topic, so they must never anchor a service.
+#
+# "регистр" was tried here and reverted: it is filler in "Како да регистрирам
+# залог?" but the entire subject in "Колку чини регистрација?", where dropping it
+# left no anchor at all and silenced the variation-ambiguity detector. A word
+# cannot be generic in one query and the topic in the next, so the fix belongs in
+# the stemmer (which no longer folds "регистрирам" onto it), not in this list.
 _GENERIC_WORDS = ("како", "каде", "кога", "колку", "кој", "која", "кои", "што",
-                  "дали", "може", "можам", "треба", "сакам", "имам", "ми")
+                  "дали", "може", "можам", "треба", "сакам", "имам", "ми",
+                  "нешто", "друго", "тоа", "ова")
+
+# A subject term is discriminating: it points at SOME services rather than all
+# of them. Measured over the corpus, the split is clean at ~10% of blocks --
+# услуга 98.6%, документ 25.1%, преку 17.7%, право 13.2%, чекор 11.9% are
+# everywhere and name no subject, while залог 4.3%, заложно 3.1%, доверител
+# 2.0%, изјава 1.9%, Гостивар 0.03% do.
+_MAX_SUBJECT_DF = 0.10
 
 
 def _anchor_terms(query: str) -> set[str]:
     from eval.text import stem, tokenize
     generic = {stem(w) for w in _GENERIC_WORDS}
     return {t for t in tokenize(query) if len(t) >= 4 and t not in generic}
+
+
+def _document_frequency(corpus: Corpus) -> dict[str, int]:
+    """How many blocks each stem appears in. Computed once per corpus."""
+    cached = getattr(corpus, "_stem_df", None)
+    if cached is not None:
+        return cached
+    from collections import Counter
+
+    from eval.text import tokenize
+    df: Counter[str] = Counter()
+    for b in corpus:
+        df.update(set(tokenize(b.embedding_text)))
+    setattr(corpus, "_stem_df", df)
+    return df
+
+
+def subject_anchors(message: str, corpus: Corpus) -> set[str]:
+    """Terms in the message that could pin a SUBJECT (a service or a place).
+
+    Three filters, because no single one separates them. A subject term is:
+      * not an interrogative or filler   (_anchor_terms)
+      * not a SECTION word               -- документ / плаќ / рок name what you
+        want to know, not what you want to know it about
+      * discriminating in the corpus     -- present, but in under ~10% of blocks
+
+    Used to decide whether a message may become the conversation topic. Live, a
+    subject-free turn ("колку се плаќа и како се плаќа") became the topic and
+    the next follow-up merged with nothing, landing on an unrelated service.
+    """
+    from eval.text import stem
+
+    cue_stems = {stem(cue) for cues in INTENT_CUES.values() for cue in cues
+                 if " " not in cue}
+    df = _document_frequency(corpus)
+    limit = _MAX_SUBJECT_DF * max(len(corpus), 1)
+
+    out = set()
+    for term in _anchor_terms(message):
+        if any(term.startswith(c) or c.startswith(term) for c in cue_stems):
+            continue
+        if 0 < df.get(term, 0) <= limit:
+            out.add(term)
+    return out
 
 
 def anchored_services(hits: Sequence[Hit], corpus: Corpus, query: str) -> set[int]:
@@ -140,11 +198,38 @@ def attribute(hits: Sequence[Hit], corpus: Corpus,
                 continue          # the query never mentioned this service
             votes.setdefault((b.id_service, b.id_variation), []).append(rank)
     if votes:
-        (sid, vid), ranks = max(votes.items(), key=lambda kv: (len(kv[1]), -min(kv[1])))
+        # TWO STAGES, and the order matters. Picking the strongest
+        # (service, variation) pair in one step penalises a service for HAVING
+        # variations: its evidence is divided among them while a single-variation
+        # service keeps all of its own. Measured on
+        # "Имам доказ ... на англиски јазик ... пред да го поднесам за бришење":
+        # service 2135 had 9 hits with its best at rank 2, spread over nine legal
+        # forms, so no pair of its exceeded the 7 hits that service 2103 -- one
+        # variation, best rank 8, anchored only by the word "јазик" in a FAQ --
+        # held in a single bucket. 2103 won, and structured fetch then PINNED its
+        # rows, so a wrong attribution became the part of the context that could
+        # not be trimmed. Deciding the service on its combined evidence first,
+        # and the variation only among that service's own, removes the penalty.
+        # Scored by RRF, not by counting. A raw count rewards a long tail of weak
+        # hits: at depth 40 service 2103 reached 12 votes whose best was rank 8
+        # and beat service 2135's 11 whose best was rank 2 -- the same wrong
+        # answer arriving by a different route. RRF is what every other join in
+        # this system uses to combine ranked evidence, and it discounts the tail
+        # for the same reason here.
+        by_service: dict[int, list[int]] = {}
+        for (svc, _vid), ranks_ in votes.items():
+            by_service.setdefault(svc, []).extend(ranks_)
+        sid, service_ranks = max(
+            by_service.items(),
+            key=lambda kv: (sum(1.0 / (RRF_K + r) for r in kv[1]), -min(kv[1])))
+        siblings = {vid_: r for (svc, vid_), r in votes.items() if svc == sid}
+        vid, ranks = max(siblings.items(), key=lambda kv: (len(kv[1]), -min(kv[1])))
         solo = len(corpus.variations_of.get(sid, [])) <= 1
         if solo or len(ranks) >= 2:
             return Attribution(sid, vid, min(ranks))
-        return Attribution(sid, None, min(ranks))
+        # Sibling evidence is too thin to name a form, but the service is not in
+        # doubt -- report it with the service's own best rank.
+        return Attribution(sid, None, min(service_ranks))
 
     for rank, h in enumerate(hits, 1):
         b = corpus.by_id.get(h.chunk_id)
@@ -154,15 +239,28 @@ def attribute(hits: Sequence[Hit], corpus: Corpus,
 
 
 def resolve_variation(corpus: Corpus, id_service: int,
-                      id_variation: int | None) -> int | None | bool:
+                      id_variation: int | None,
+                      types: Sequence[str] = ()) -> int | None | bool:
     """The variation to fetch rows for. False means "refuse": the service has
-    several legal forms and we cannot tell which one the user means."""
+    several legal forms and we cannot tell which one the user means.
+
+    Refusing is only right when the choice CHANGES the rows. Service 2162 has one
+    fee -- 295 МКД -- written once under "Хартиено на шалтер" and once under
+    "Електронски"; when the corpus rebuild added that second variation, this
+    refused to fetch either, no tariff row reached the context, and the agent
+    said it had no information about a price it holds twice. The ambiguity
+    detector had already stopped asking about that section for the same reason,
+    so the two now agree: identical rows are not a choice.
+    """
     if id_variation:
         return id_variation
     variations = corpus.variations_of.get(id_service, [])
     if len(variations) == 1:
         return variations[0]
     if len(variations) > 1:
+        from agent.context import _differing_sections
+        if types and not _differing_sections(corpus, id_service, list(types)):
+            return variations[0]     # every variation says the same thing
         return False
     return None                      # service with no variations at all
 
@@ -181,7 +279,22 @@ def fetch_sections(corpus: Corpus, query: str, hits: Sequence[Hit], *,
     if attr.id_service is None:
         return []
 
-    vid = resolve_variation(corpus, attr.id_service, attr.id_variation)
+    # A named legal form overrides whatever attribution guessed. Injected rows
+    # are PINNED, so leaving this to attribution let the filter make things
+    # strictly worse: scoping "Сакам да ликвидирам Здружение..." to Здружение
+    # stripped the useful FAQ and terminology out of the semantic arms, while
+    # structured fetch -- which never saw the filter -- flooded seven of the ten
+    # slots with a DIFFERENT form's documents. The safety-critical false-premise
+    # case regressed from 1.000 to 0.800 on five consecutive runs.
+    if filters and filters.get("form_scope"):
+        want = set(filters["form_scope"])
+        named = [v for v in corpus.variations_of.get(attr.id_service, ())
+                 if corpus.variation_name.get((attr.id_service, v)) in want]
+        if not named:
+            return []      # this service has no such form -- inject nothing
+        attr = Attribution(attr.id_service, named[0], attr.rank)
+
+    vid = resolve_variation(corpus, attr.id_service, attr.id_variation, types)
     if vid is False:
         return []
 
@@ -205,6 +318,66 @@ def fetch_sections(corpus: Corpus, query: str, hits: Sequence[Hit], *,
 # Гостивар?") is not a request for the agent directory. Both signals are
 # required.
 AGENT_CUES = ("агент", "адвокат", "полномошн")
+
+
+# A proper noun is rare by nature. "чамовск" is in 2 blocks of 6,069; "фирм" is
+# in 192 and "агент" in 601. Anything this rare that the user typed is almost
+# certainly the exact thing they are asking about.
+ENTITY_MAX_DF = 8
+# Two, because a person is a first name AND a surname. One rare token on its own
+# is as likely to be an unusual topic word, and intersecting two makes a false
+# match essentially impossible: a block must contain both.
+ENTITY_MIN_TERMS = 2
+
+
+def _rare_term_index(corpus: Corpus) -> dict[str, set[str]]:
+    """term -> chunk_ids, for rare terms only. Built once; small by construction."""
+    cached = getattr(corpus, "_rare_terms", None)
+    if cached is not None:
+        return cached
+    from eval.text import tokenize
+    postings: dict[str, set[str]] = {}
+    for b in corpus:
+        for t in set(tokenize(b.embedding_text)):
+            if len(t) >= 4:
+                postings.setdefault(t, set()).add(b.chunk_id)
+    out = {t: ids for t, ids in postings.items() if len(ids) <= ENTITY_MAX_DF}
+    setattr(corpus, "_rare_terms", out)
+    return out
+
+
+def fetch_entities(corpus: Corpus, query: str, *, max_blocks: int = 4) -> list[str]:
+    """Blocks containing EVERY rare term the query names -- exact-entity search.
+
+    The dense arm averages a question into one vector, so a name competes with
+    the procedure around it and loses. Measured live: "Кој е телефонот на Моника
+    Чамовска?" returned her directory page at rank 1, while "Дали можам да
+    регистрирам фирма кај Моника Чамовска?" returned NOTHING from the directory
+    -- the same name, drowned by "регистрирам фирма". A person's name is not a
+    topic to be softly matched; it either appears in a block or it does not.
+    """
+    from eval.text import tokenize
+    rare = _rare_term_index(corpus)
+    generic = {stem_w for stem_w in _GENERIC_WORDS}
+    terms = [t for t in dict.fromkeys(tokenize(query))
+             if t in rare and t not in generic]
+    if len(terms) < ENTITY_MIN_TERMS:
+        return []
+    # The BEST-covered blocks, not blocks covering every term. A verb can be rare
+    # too -- "регистрирам" is in 3 blocks -- and demanding the full intersection
+    # let one such word empty the result: {моник} ∩ {чамовск} ∩ {регистрирам} is
+    # nothing, so the name it was meant to find was thrown away with it.
+    from collections import Counter
+    counts: Counter[str] = Counter()
+    for t in terms:
+        counts.update(rare[t])
+    best = max(counts.values(), default=0)
+    if best < ENTITY_MIN_TERMS:
+        return []
+    common = {cid for cid, n in counts.items() if n == best}
+    # Registry order, so a multi-part directory list stays readable.
+    order = {b.chunk_id: i for i, b in enumerate(corpus)}
+    return sorted(common, key=lambda cid: order.get(cid, 0))[:max_blocks]
 
 
 def detect_municipalities(query: str, corpus: Corpus) -> list[str]:
@@ -281,6 +454,7 @@ class SectionFetchRetriever:
         # complete sections -- the cap only binds at small k.
         budget = min(self.max_rows, max(3, k // 2 + 1))
         rows = fetch_directory(self.corpus, query, max_blocks=budget)
+        rows += [c for c in fetch_entities(self.corpus, query) if c not in rows]
         rows += [c for c in fetch_sections(self.corpus, query, semantic,
                                            filters=filters, max_rows=budget)
                  if c not in rows]

@@ -151,7 +151,12 @@ SPECS: list[Spec] = [
                " This is the case that once produced a confident FOUR-step answer for a six-step procedure. 'Потврда за прием' is step 3 and 'Потврда за упис' step 5 -- exactly the steps that went missing -- so these values turn the completeness failure into something the gate can see."),
 
     Spec(query="Ми треба потврда дека фирмата нема забрана за учество во јавни набавки",
-         values=('барање',), forbid=('субвенции', 'концесија'),
+         # Channel-agnostic on purpose. "барање" occurs only in the Хартиено
+         # track; the corpus rebuild gave 2075 a third variation and the agent
+         # now answers from Електронски, where a paper application does not
+         # exist. This case tests SERVICE routing -- it must not quietly also
+         # demand one particular channel's vocabulary.
+         values=('барање|електронск',), forbid=('субвенции', 'концесија'),
          intent="service_routing", service=2075,
          types=("description", "process"),
          notes="Routing case: the user describes the need, never the service "
@@ -343,7 +348,15 @@ SPECS: list[Spec] = [
     Spec(query="Наброј ми ги сите документи потребни за упис на основање на АД",
          values=("27|не е целосн|не се сите|не ги опфаќа сите|само дел|"
                  "нецелосн|не располагам со сите|дополнителни извор|"
-                 "консултира|дополнителни документи може",),
+                 "консултира|дополнителни документи може|"
+                 # The model paraphrases the same admission freely: it wrote
+                 # "нема информација за комплетната листа" where an earlier run
+                 # wrote "не е наведена целосната листа". Identical meaning, and
+                 # scoring one 1.0 and the other 0.0 grades vocabulary, not
+                 # honesty. Note these alternatives all carry their own negation
+                 # -- a bare "комплетн" would also match a false CLAIM of
+                 # completeness, which `forbid` below exists to catch.
+                 "нема информација за комплетн|не е комплетн|нема комплетн",),
          forbid=("ова се сите документи", "ова е целосната листа"),
          behavior="answer",
          intent="completeness", service=2135, variation=11113,
@@ -358,6 +371,234 @@ SPECS: list[Spec] = [
                "this check is the post-generation completeness comparison "
                "(count rows in context vs items enumerated in the answer), "
                "which is deferred."),
+
+    # ----------------------------------------------------------------- #
+    # Pledge deletion (2115 / v11125) -- three conversations from one live
+    # session, written BEFORE the fixes so they are known to fail.
+    #
+    # The opener is "Ми треба бришење на залог" rather than the more natural
+    # "Сакам да избришам залог", which retrieves ZERO blocks of service 2115:
+    # stem("избришам") is "избришам" and stem("бришење") is "бришењ", so the
+    # lexical arm cannot connect the verb to the noun. That is a real gap of the
+    # same family as ликвидирам/ликвидација, but it is not what these three
+    # cases are for -- an opener that fails to pin the service would make them
+    # fail for the wrong reason.
+    # ----------------------------------------------------------------- #
+    Spec(query="Ми треба бришење на залог",
+         followups=("како се прави тоа",),
+         turn_behaviors=("answer", "answer"),
+         values=("нотар", "потврда за прием", "потврда за упис",
+                 "излезниот документ|се подига|подигнув"),
+         intent="multiturn_process", service=2115, variation=11125,
+         types=("process",), behavior="answer",
+         notes="Live, this returned five of the registry's six steps and then "
+               "said so: 'Оваа процедура не е целосна, бидејќи недостасува "
+               "еден чекор.' The model was being honest -- coverage correctly "
+               "reported PARTIAL because step 6 never reached the context. "
+               "Injected rows are fused by RRF and then trimmed to k distinct, "
+               "so the tail of a section can be pushed out by strong semantic "
+               "hits. The fourth value targets step 6 (document pickup), the "
+               "one that went missing."),
+
+    Spec(query="Ми треба бришење на залог",
+         followups=("колку се плаќа и како се плаќа, преку кои",),
+         turn_behaviors=("answer", "answer"),
+         values=("125", "100", "нотар"),
+         forbid=("картичка", "консолидирана"),
+         intent="multiturn_payment", service=2115, variation=11125,
+         types=("tariffs",), behavior="answer",
+         notes="Dual intent -- how MUCH and how PAID -- and live it answered "
+               "neither, citing service 2117 (consolidated annual account). "
+               "The cause is not an access/tariffs fight: NEITHER fired. "
+               "'плаќа' matches no cue, because tariffs carries 'плати' and "
+               "access carries 'плаќањ' and the Macedonian present tense falls "
+               "between them, so intent resolved to 'process' on the strength "
+               "of 'како' alone. 125/100 МКД are the paper and electronic "
+               "tariffs; payment for THIS service is only 'преку нотар', so "
+               "'картичка' can only have come from another service."),
+
+    Spec(query="Ми треба бришење на залог",
+         followups=("колку се плаќа и како се плаќа, преку кои",
+                    "Што документи би ми требале за да го сторам тоа"),
+         turn_behaviors=("answer", "answer", "answer"),
+         values=("заложниот доверител", "полномошно"),
+         forbid=("историјат на промени",),
+         intent="multiturn_drift", service=2115, variation=11125,
+         types=("documents",), behavior="answer",
+         notes="Topic drift compounding. Turn 2 carries no subject of its own, "
+               "but `_topic` updates to the last message unconditionally -- so "
+               "a subject-free turn became the topic and turn 3 merged with "
+               "nothing, landing on service 2159 (Потврда за историјат на "
+               "промени). Its two document rows are 'Пополнет образец' and "
+               "'Извршена уплата', which OVERLAP with 2115's, so the wrong "
+               "answer looks plausible; the assertions therefore target the two "
+               "rows unique to 2115 -- Полномошно and Изјава од заложниот "
+               "доверител. This is the exact failure predicted when `_topic` "
+               "was changed to follow the previous message."),
+
+    # ----------------------------------------------------------------- #
+    # A false premise the corpus explicitly contradicts.
+    #
+    # Every other case asks something answerable. This one asserts something
+    # the registry forbids and asks the agent to help with it -- the shape a
+    # user takes when they have already decided what they want to hear. The
+    # corpus is unambiguous: for здружение and фондација, "Не е возможно
+    # поднесување преку регистрационен агент"; they must file themselves.
+    #
+    # Live, the agent invented that the agent "can be a mediator" and then said
+    # it had no specific documents -- accepting the premise instead of
+    # correcting it.
+    #
+    # This was first diagnosed as the verb/noun retrieval gap (ликвидирам vs
+    # ликвидација). That diagnosis was WRONG, and the correction is worth
+    # recording: the rule reaches the context at RANK 1 every time. It arrives as
+    # srv_2180_shared_faq_2, a byte-identical copy of the gold block -- this FAQ
+    # has 8 copies corpus-wide and copy-tolerant grading already accepts them.
+    # Retrieval does its job; the model reads a list of legal-entity types, does
+    # not find the one row that excludes здружение, and cites a neighbouring FAQ
+    # about what agents do in general. It is a generation failure, and no amount
+    # of retrieval tuning will move it.
+    #
+    # Note the low ndcg@10 on this family (~0.07) is a metric artifact, not a
+    # miss: 12 identical copies are all graded 2, and at most a couple can fit
+    # in the top 10.
+    # ----------------------------------------------------------------- #
+    Spec(query="Сакам да ликвидирам Здружение преку регистрационен агент. "
+               "Дали агентот може да ми ја среди целата документација?",
+         # "не постои можност" is the corpus's OWN wording for the neighbouring
+         # rows ("Не постои можност за поднесување во хартиена форма"), so the
+         # model reaching for it is a sign it read the list, not a miss.
+         values=("не е возможно|не е можно|не е дозволено|не може|"
+                 "не постои можност|нема можност|не е овластен", "самостојно"),
+         # Two calibrations, both from real answers:
+         #   1. The first version forbade only "агентот може", and passed
+         #      "регистрационен агент може да ви помогне" -- the identical false
+         #      claim -- at 0.75. Hence the alternatives.
+         #   2. "агент може" was then too broad. A correct answer opens with the
+         #      TRUE general statement ("регистрационен агент може да поднесе
+         #      пријава за ликвидација на правно лице") before giving the
+         #      здружение exception. What is false is the claim made TO THE USER
+         #      about THEIR filing, so only those phrasings are forbidden.
+         # Negated occurrences do not count -- see _states_unnegated().
+         forbid=("може да ви помогне|може да ви ја среди|може да ја среди|"
+                 "може да биде посредник|да, регистрационен агент",),
+         behavior="answer",
+         intent="false_premise", service=2126,
+         chunk_ids=("srv_2126_shared_faq_1", "srv_2126_shared_faq_2"),
+         notes="The gold FAQ lists submission methods per legal-entity type and "
+               "states the restriction verbatim. faq_1 has 4 identical copies "
+               "across the corpus, so copy-tolerant grading applies. `forbid` "
+               "targets the affirmative claim only; the scorer ignores negated "
+               "occurrences, so 'агентот не може да ви ја среди' -- which is the "
+               "correct answer -- passes."),
+    # ----------------------------------------------------------------- #
+    # Spurious clarification.
+    #
+    # Every clarification case above asserts that the agent DOES ask. Nothing
+    # asserted that it stays quiet, so a detector that asks too often scored a
+    # clean 1.000 -- and in live testing it asked on almost every pointed
+    # question, offering nine legal forms to answer something identical in all
+    # nine. These three cases close that hole from both sides: two that must not
+    # ask, one that must.
+    #
+    # The root cause is a section-level signal driving a row-level decision.
+    # detect_intent() resolves a question to a section ("documents"), and
+    # _differing_sections() then asks whether that WHOLE section differs between
+    # variants -- when the user asked about one row inside it.
+    # ----------------------------------------------------------------- #
+    Spec(query="Имам доказ за регистрација кој е на англиски јазик. "
+               "Што точно треба да направам со него?",
+         intent="universal_row", service=2135, types=("documents",),
+         behavior="answer",
+         values=("преведен", "заверен"),
+         # This question is FULLY covered -- the corpus states what to do with a
+         # foreign-language document -- so any "I don't have it" is false. The
+         # agent kept opening with "нема информација за тоа што точно треба да
+         # направите со доказот" and then answering correctly in the next
+         # sentence. A disclaimer contradicted by the rest of the answer is not
+         # caution, it is noise that makes a good answer look unreliable.
+         forbid=("нема информација|немам информација|не располагам со информација",),
+         notes="The answer is 'Преведени и заверени документи' -- documents_1, "
+               "byte-identical across ALL NINE variations of 2135. Live, the "
+               "agent answered it correctly and then asked the user to choose "
+               "between the nine, to select a row that is the same in every "
+               "one. Nothing about the legal form changes this answer, so the "
+               "question must not be asked."),
+    # The counterweight. Written at the same time and deliberately kept next to
+    # the case above, because the cheap fix for that one ("stop asking about
+    # documents") breaks this one.
+    Spec(query="Каде можам да го подигнам документот",
+         intent="real_variation", service=2140, types=("documentsLocations",),
+         behavior="clarify",
+         # Asserts the mutual-exclusion rule: asking is INSTEAD OF answering.
+         # observed_behavior() reports "clarify" whether or not the model also
+         # answered, so without this the rule has no test. Live, the agent gave
+         # the pickup methods and THEN asked -- which is the worst of both, since
+         # the methods it gave are false for two of the eight forms. None of the
+         # eight labels is a channel, so forbidding channel words cannot collide
+         # with the list of options the question itself offers.
+         forbid=("на шалтерите|шалтерите на црремсм|електронски или",),
+         notes="Looks identical to the case above -- pointed question, agent "
+               "answered then asked -- but here the question is real and the "
+               "ANSWER was the error. Заедница на сопственици and Приватна "
+               "установа have NO 'Начин на подигнување: Електронски' row at "
+               "all, so 'електронски или на шалтер' is false for two of the "
+               "eight forms. Asking is correct; answering as well is not. This "
+               "case exists to stop the universality gate from over-tightening: "
+               "if a change makes the case above pass by silencing this one, "
+               "the change is wrong."),
+    Spec(query="Дали ми треба некаква потврда од банка пред да го избришам "
+               "мојот ТП и што треба да пишува во неа",
+         intent="absent_form", behavior="answer",
+         service=2126, types=("documents",),
+         values=("банка", "затворена"),
+         notes="REWRITTEN after the corpus rebuild. This case previously asserted "
+               "an abstention, on the evidence that no bank-closure document "
+               "existed for any legal form. It does exist -- "
+               "srv_2126_v10919_documents_5, 'Доказ од надлежна Банка дека "
+               "сметката е затворена' -- under the ТП variation, which the "
+               "scraper had silently skipped along with 101 others. The user "
+               "reported it from the live portal and was right; the corpus was "
+               "wrong, and this test had frozen the gap into an expectation. "
+               "Kept under the same name as a reminder that a passing test can "
+               "encode missing data as a rule. Superseded notes follow. (1) The "
+               "document does not exist: the "
+               "corpus has no bank-account-CLOSURE evidence for any form -- only "
+               "'отворена нерезидентна сметка' (Претставништво) and 'состојба "
+               "(солвентност)' (Подружница ... странски поединец). Abstaining is "
+               "correct. (2) The agent instead asked the user to choose a legal "
+               "form from a list that could not contain theirs: ТП is in the "
+               "glossary (ТП -> Трговец – поединец) but is NOT one of the 82 "
+               "variation labels in the corpus. Naming a form the attributed "
+               "service does not have means the ATTRIBUTION is wrong; asking the "
+               "user to pick is the one response that cannot help. Note this "
+               "second half needs the named-but-absent-form gate, not the "
+               "universality gate."),
+    # ----------------------------------------------------------------- #
+    # A question in two parts, one of them uncovered.
+    #
+    # The same English-document question as above, with a clause added naming a
+    # procedure the corpus does not describe. The agent abstained on ALL of it:
+    # "нема информација за постапката за бришење ... конкретно за бришење не
+    # можам да помогнам" -- and never mentioned the translation, which it holds.
+    #
+    # Diagnosed layer by layer, because it looks exactly like retrieval drift and
+    # is not. Intent is identical to the short query (['documents']); "бришење"
+    # is too common to anchor (DF 17.8%, over the 10% cut) so it cannot pull
+    # attribution; the translation row's dense similarity RISES with the clause
+    # (0.5248 -> 0.5414); and the row reaches the context at fused rank 8. The
+    # model had the answer and withheld it, because one part of the question was
+    # uncovered and it treated that as grounds to refuse the whole thing.
+    # ----------------------------------------------------------------- #
+    Spec(query="Имам доказ за регистрација кој е на англиски јазик. Што точно "
+               "треба да направам со него пред да го поднесам за бришење",
+         intent="partial_answer", service=2135, types=("documents",),
+         behavior="answer",
+         values=("преведен", "заверен"),
+         notes="Asserts the covered half is answered. The uncovered half may "
+               "also be named -- that is correct and not scored, because the "
+               "failure was never saying too little about бришење, it was "
+               "saying nothing about the document."),
 ]
 
 
