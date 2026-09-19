@@ -17,6 +17,9 @@ from __future__ import annotations
 from .entity_profile import (EntityProfile, ProfileResult, ProfileUnavailable,
                              fetch_profile)
 from .entity_size import EntitySize
+from .registration_decision import (DecisionResult, DecisionRow, DecisionSection,
+                                    DecisionUnavailable, RegistrationDecision,
+                                    fetch_decision)
 
 # Recorded 2026-09-18 from https://e-submit.crm.com.mk/AAOL/pCheckLeSize.aspx
 # ЛОРА КОМПАНИ 2023 ДОО Скопје -- the entity used in the Form 1 bring-up.
@@ -90,7 +93,60 @@ def fixture_profile(embs: str) -> ProfileResult | ProfileUnavailable:
     return fetch_profile(embs, source=_FixtureSource())
 
 
+# Form 3, recorded from agent/tools/assets/decision_30120260014967.png -- two
+# independent gpt-4o reads, identical, checked row by row against the image.
+# Tables only: the preamble paragraph is deliberately not read (see
+# registration_decision's module docstring for the three misreads it produced).
+#
+# Note the entity: ЕМБС 7405855 is the same company Form 1 records as микро, and
+# this decision independently prints микро. Two tools, one fact, no shared code
+# path between them.
+def _rows(*pairs: tuple[str, str]) -> list[DecisionRow]:
+    return [DecisionRow(label=label, value=value) for label, value in pairs]
+
+
+_TOPOLCHAN = ("Друштво за производство, трговија и услуги ТОПОЛЧАН АГРАР ДООЕЛ "
+              "с.Тополчани Прилеп - во ликвидација")
+_ENTRY = "Документ за определување на главна приходна шифра и големина"
+
+RECORDED_DECISIONS = {
+    "30120260014967": RegistrationDecision(
+        deloveden_broj="30120260014967", entry_type=_ENTRY, embs="7405855",
+        full_name=_TOPOLCHAN,
+        sections=[
+            DecisionSection(title="Деловодник", rows=_rows(
+                ("Прием на пријавата", "17 септ. 2026"),
+                ("Вид на упис", _ENTRY),
+                ("Деловоден број", "30120260014967"),
+                ("Начин на доставување", "По службена должност"),
+                ("Одобрување на пријавата", "17 септ. 2026"))),
+            DecisionSection(title="Основни податоци за субјектот на упис",
+                            rows=_rows(
+                ("ЕМБС", "7405855"),
+                ("Целосен назив", _TOPOLCHAN),
+                ("Големина на субјектот", "микро"))),
+            DecisionSection(title="Дејности", rows=_rows(
+                ("Приоритетна дејност / Главна приходна шифра",
+                 "01.250 - Одгледување јагодесто, јатчесто и друго овошје"))),
+        ]),
+}
+
+
+class _FixtureDecisionSource:
+    """A DecisionSource backed by the recording above -- same seam, so the
+    self-check and consistency checks run over it exactly as over a live read."""
+    name = "fixture"
+
+    def load(self, deloveden_broj: str):
+        return RECORDED_DECISIONS.get(deloveden_broj)
+
+
+def fixture_decision(deloveden_broj: str) -> DecisionResult | DecisionUnavailable:
+    return fetch_decision(deloveden_broj, source=_FixtureDecisionSource())
+
+
 DISPATCH = {
     "check_entity_size": lambda **kw: fixture_entity_size(**kw),
     "get_entity_profile": lambda **kw: fixture_profile(**kw),
+    "get_registration_decision": lambda **kw: fixture_decision(**kw),
 }

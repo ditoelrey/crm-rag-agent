@@ -61,7 +61,7 @@ After EVERY factual statement, cite the document it came from using its exact
 Some questions are answered by a live check against the Registry rather than by
 the documents -- the size of one specific entity, for example. When a tool
 returns a result it includes a `citation_id`; cite it exactly like a document id
-and in the same square brackets, e.g. [tool:entity_size:07696876].
+and in the same square brackets, copying the id character for character.
 - A tool result is data about ONE entity at ONE moment. Say what it says, do not
   generalise from it, and do not restate it in a later turn from memory.
 - A tool result set out as rows or bullets still needs its `citation_id`: put it

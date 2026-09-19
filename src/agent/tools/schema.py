@@ -9,15 +9,17 @@ Two things model_json_schema() does that OpenAI's strict modes reject or punish:
     and structured outputs require -- the API rejects the request without it.
 
 Field descriptions are kept: those are written FOR the model.
+
+Nested models land in `$defs`, and strict mode holds EVERY object schema to the
+same rules, not just the top one -- so each definition gets the same treatment.
+Flat models (Forms 1 and 2) have no `$defs` and are unaffected.
 """
 from __future__ import annotations
 
 from pydantic import BaseModel
 
 
-def strict_schema(model: type[BaseModel]) -> dict:
-    """A schema OpenAI accepts in strict mode. See module docstring."""
-    schema = model.model_json_schema()
+def _strict_object(schema: dict) -> None:
     schema.pop("description", None)
     schema.pop("title", None)
     for prop in schema.get("properties", {}).values():
@@ -29,4 +31,12 @@ def strict_schema(model: type[BaseModel]) -> dict:
     schema["additionalProperties"] = False
     # Strict mode requires EVERY property in `required`, optional or not.
     schema["required"] = list(schema.get("properties", {}))
+
+
+def strict_schema(model: type[BaseModel]) -> dict:
+    """A schema OpenAI accepts in strict mode. See module docstring."""
+    schema = model.model_json_schema()
+    _strict_object(schema)
+    for definition in schema.get("$defs", {}).values():
+        _strict_object(definition)
     return schema

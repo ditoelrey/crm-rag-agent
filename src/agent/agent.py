@@ -147,6 +147,22 @@ _ABSTAIN_MARKERS = ("нема информација", "немам информ�
                     # exists to keep ungrounded.
                     "не е достапен", "не е достапна", "не е достапно",
                     "не се достапни")
+# An uncited reply may also ASK the user for something the agent needs. The
+# prompt has always allowed that; the guard never did, which did not matter
+# while clarification was structural (context.detect_ambiguity asks, and never
+# reaches the model). Form 3 made it matter: given only an ЕМБС, the model
+# correctly asked for the деловоден број in 3 runs of 3, and the guard replaced
+# every one with "нема информација" -- false, since the agent CAN answer once
+# it has the number.
+#
+# These are first-person needs, "I need ...", with the dative ми. A factual
+# answer about the registry says what is required -- "потребни се", "потребен
+# е" -- never what the assistant itself needs, and not one of these phrases
+# occurs anywhere in the 7,759-block corpus that answers paraphrase. That is
+# what keeps this from becoming a way for an ungrounded answer to slip through.
+_REQUEST_MARKERS = ("потребен ми е", "потребна ми е", "потребно ми е",
+                    "потребни ми се", "ми е потребен", "ми е потребна",
+                    "ми е потребно", "ми треба")
 HARD_ABSTENTION = ("Во документацијата со која располагам нема информација "
                    "за ова прашање.")
 
@@ -521,7 +537,8 @@ class CRMAgent:
         # which belong to other legal forms. Nothing in the answer was citable,
         # and the citation count said 0/10 while the text read as authoritative.
         # A prompt rule did not prevent this and cannot; the check is structural.
-        if not valid and not any(m in _norm(text) for m in _ABSTAIN_MARKERS):
+        if not valid and not any(m in _norm(text)
+                                 for m in _ABSTAIN_MARKERS + _REQUEST_MARKERS):
             text = HARD_ABSTENTION
             stale, invalid = [], []
         self.seen_docs.update(d.chunk_id for d in docs)

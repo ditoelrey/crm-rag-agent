@@ -738,10 +738,167 @@ def _profile_tool_tests(c) -> None:
           sorted(names), sorted(LIVE_DISPATCH))
     check("...and every one has a fixture for the gates",
           sorted(FIXTURE_DISPATCH), sorted(LIVE_DISPATCH))
+    # NO REAL IDENTIFIERS IN WHAT THE MODEL READS. Every tool once shipped a
+    # real company's ЕМБС or filing number as its "e.g.", and the system prompt
+    # did too -- so a model that copied an example instead of asking the user
+    # would have looked up a real company nobody mentioned. Any run of 7+
+    # digits (ЕМБС 7-8, ЕДБ 13, деловоден број 14) in a contract is one of those.
+    import json as _json
+    import re as _re
+
+    from .prompts import SYSTEM_PROMPT
+    leaked = {
+        name: _re.findall(r"\d{7,}", text) for name, text in
+        [(t["function"]["name"], _json.dumps(t, ensure_ascii=False))
+         for t in REGISTRY] + [("SYSTEM_PROMPT", SYSTEM_PROMPT)]}
+    check("no tool contract or prompt carries a real identifier",
+          {k: v for k, v in leaked.items() if v}, {})
     check_true("the tool tells the model to prefer the cheaper size lookup",
                "check_entity_size" in TOOL_SPEC["function"]["description"])
     check_true("...and not to retry an unavailable profile",
                "available=false" in TOOL_SPEC["function"]["description"])
+
+
+def _decision_tool_tests(c) -> None:
+    """Form 3: a published Решение, keyed by деловоден број. No model, no network."""
+    print("[registration decision]")
+    from pydantic import ValidationError
+
+    from .tools.registration_decision import (ASSETS, TOOL_SPEC, DecisionArgs,
+                                              DecisionMismatch, DecisionResult,
+                                              DecisionUnavailable,
+                                              LocalDecisionSource,
+                                              RegistrationDecision,
+                                              fetch_decision, verify_decision)
+    from .tools.fixtures import RECORDED_DECISIONS, _FixtureDecisionSource
+    from .tools.schema import strict_schema
+
+    number = "30120260014967"
+    good = RECORDED_DECISIONS[number]
+
+    # THE IDENTIFIER. An ЕМБС handed to this tool must fail validation, so the
+    # model is told why and asks for the real number instead of the lookup
+    # running on something that was never a filing number.
+    check("a 14-digit деловоден број is accepted",
+          DecisionArgs(deloveden_broj=f" {number} ").deloveden_broj, number)
+    for wrong, why in (("7405855", "an ЕМБС"), ("3012026001496", "13 digits"),
+                       ("301-2026-0014967", "punctuation")):
+        try:
+            DecisionArgs(deloveden_broj=wrong)
+            check_true(f"{why} is refused as a деловоден број", False)
+        except ValidationError:
+            check_true(f"{why} is refused as a деловоден број", True)
+
+    check("the recorded read passes every check", verify_decision(good), [])
+
+    def with_row(label: str, value: str) -> RegistrationDecision:
+        """`good` with one row's value replaced -- a single simulated misread."""
+        sections = [s.model_copy(update={"rows": [
+            r.model_copy(update={"value": value}) if r.label == label else r
+            for r in s.rows]}) for s in good.sections]
+        return good.model_copy(update={"sections": sections})
+
+    # CONSISTENCY. Each identifier is read twice -- as a field and as a table
+    # row -- and a misread in either copy fails the document.
+    check_true("a misread деловоден број row is caught",
+               bool(verify_decision(with_row("Деловоден број", "30120260014961"))))
+    check_true("a misread ЕМБС row is caught",
+               bool(verify_decision(with_row("ЕМБС", "7405856"))))
+    check_true("...but ЕМБС zero padding is not a misread",
+               verify_decision(with_row("ЕМБС", "07405855")) == [])
+    check_true("an invented size class is caught",
+               bool(verify_decision(with_row("Големина на субјектот", "мало"))))
+    check_true("a short деловоден број field is caught", bool(verify_decision(
+        good.model_copy(update={"deloveden_broj": "3012026001496"}))))
+    check_true("a document with no tables is caught",
+               bool(verify_decision(good.model_copy(update={"sections": []}))))
+
+    # THE PREAMBLE IS NOT READ. Three misreads in one paragraph, none of them
+    # checkable; the schema must not quietly grow the field back.
+    fields = set(RegistrationDecision.model_fields)
+    check_true("the schema carries no preamble or prose-derived date",
+               not fields & {"preamble", "decision_date", "registrar"})
+
+    # SELF-CHECK. The wrong filing is refused, not returned.
+    class _Other:
+        name = "test"
+
+        def load(self, n):
+            return good.model_copy(update={"deloveden_broj": "30120260014978"})
+
+    try:
+        fetch_decision(number, source=_Other())
+        check_true("another filing's decision is refused", False)
+    except DecisionMismatch:
+        check_true("another filing's decision is refused", True)
+
+    # A MISS IS AN ANSWER.
+    miss = fetch_decision("30120260014978", source=_FixtureDecisionSource())
+    check_true("an unheld filing returns a value, not an exception",
+               isinstance(miss, DecisionUnavailable))
+    check("...flagged unavailable", miss.available, False)
+    mdoc = miss.as_context_doc()
+    check("...and is citable", mdoc.chunk_id,
+          "tool:registration_decision:30120260014978:unavailable")
+    check_true("...in wording the abstention guard recognises",
+               "не е достапно" in mdoc.block.content)
+    check_true("...and cannot be mistaken for decision data",
+               "ЕМБС" not in mdoc.block.content and "микро" not in mdoc.block.content)
+
+    # CITABLE TEXT. Everything a user could be told, verbatim.
+    hit = fetch_decision(number, source=_FixtureDecisionSource())
+    check_true("a held filing returns the decision", isinstance(hit, DecisionResult))
+    doc = hit.as_context_doc()
+    check("the decision is citable", doc.chunk_id,
+          f"tool:registration_decision:{number}")
+    for label, value in (("деловоден број", number), ("ЕМБС", "7405855"),
+                         ("вид на упис", "главна приходна шифра"),
+                         ("датум", "17 септ. 2026"), ("големина", "микро"),
+                         ("дејност", "01.250")):
+        check_true(f"{label} survives into the citable text", value in doc.block.content)
+    check_true("tables keep their titles in the citable text",
+               "[Дејности]" in doc.block.content)
+
+    # OFFLINE SOURCE: the saved image resolves by its number, nothing else does.
+    src = LocalDecisionSource(ASSETS)
+    check_true("the saved image resolves by деловоден број",
+               src.path_for(number).is_file())
+    check_true("an unsaved number does not", not src.path_for("30120260014978").is_file())
+
+    # SCHEMA. Nested models live in $defs, and strict mode holds every one of
+    # them to the same rules -- a nested object without additionalProperties
+    # false is rejected by the API at call time, not here, unless we check.
+    schema = strict_schema(RegistrationDecision)
+    objects = [schema, *schema.get("$defs", {}).values()]
+    check_true("every nested object is strict", all(
+        o.get("additionalProperties") is False
+        and sorted(o["required"]) == sorted(o["properties"])
+        and "description" not in o for o in objects),
+        f"{len(objects)} object schemas")
+
+    description = TOOL_SPEC["function"]["description"]
+    check_true("the tool says an ЕМБС is not a деловоден број",
+               "НЕ е деловоден број" in description)
+    check_true("...and never to invent one", "НИКОГАШ не измислувај" in description)
+
+    # THE GUARD AND A REQUEST FOR INPUT. Given only an ЕМБС, the right reply
+    # asks for the number and cites nothing -- and the abstention guard used to
+    # replace it with "нема информация". Both halves are checked: the request
+    # gets through, and an uncited FACTUAL answer still does not, because the
+    # second is the hallucination the guard was built for.
+    from .agent import HARD_ABSTENTION
+    single = [b.chunk_id for b in c.by_service[2029] if b.type == "tariffs"]
+    q = "Дај ми го решението за упис за субјектот со ЕМБС 7405855."
+    ask_back = ("За да го пронајдам решението, потребен ми е деловодниот број "
+                "(14 цифри). ЕМБС не е доволен.")
+    a = CRMAgent(corpus=c, retriever=StubRetriever(single),
+                 client=StubClient(ask_back)).ask(q)
+    check("an uncited request for the number reaches the user", a.text, ask_back)
+    made_up = "За основање на ДОО потребни се Статут и Програма за работа."
+    a = CRMAgent(corpus=c, retriever=StubRetriever(single),
+                 client=StubClient(made_up)).ask(q)
+    check("...while an uncited factual claim is still replaced",
+          a.text, HARD_ABSTENTION)
 
 
 def _orchestration_tests(c) -> None:
@@ -1005,7 +1162,7 @@ def main() -> int:
     for stage in (_dedup_tests, _ambiguity_tests, _structure_ambiguity_tests,
                   _structured_fetch_tests, _citation_tests, _clarification_tests,
                   _injection_tests, _tool_tests, _profile_tool_tests,
-                  _orchestration_tests):
+                  _decision_tool_tests, _orchestration_tests):
         try:
             stage(c)
         except Exception:

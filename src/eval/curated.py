@@ -662,6 +662,32 @@ SPECS: list[Spec] = [
                "about is that the reply carries no other entity's fields, and "
                "that a miss stays a returned value -- an exception here would "
                "take down the turn instead of answering it."),
+    # FORM 3. A published Решение, addressed by its деловоден број. The asserted
+    # values -- the size class and the activity code -- are what THIS decision
+    # decided, and together they occur nowhere in the corpus, so stating them
+    # proves the image was read rather than the documentation paraphrased.
+    Spec(query="Што е одлучено со решението со деловоден број 30120260014967?",
+         intent="live_lookup", behavior="answer", live_tool=True,
+         values=("микро", "01.250"),
+         notes="The Form 3 path end to end: a nested vision schema, the "
+               "деловоден-број self-check, the field-vs-row consistency check "
+               "and the citation. Tables only -- the preamble was dropped after "
+               "it produced three uncatchable misreads, one of them a real "
+               "official's surname."),
+    Spec(query="Дај ми го решението за упис за субјектот со ЕМБС 7405855.",
+         intent="live_lookup", live_tool=True,
+         # The identifier boundary. Only an ЕМБС was given, and Form 3 is keyed
+         # by деловоден број, so the right move is to ask for the number. The
+         # failure this catches is the model FABRICATING a 14-digit number to
+         # get a call through: every call carries the citation directive, so an
+         # invented number shows up as a tool:registration_decision citation
+         # whether it happened to hit or not.
+         forbid=("tool:registration_decision",),
+         notes="Behaviour is NOT graded: asking for the деловоден број, "
+               "offering the entity's profile instead, or both are all fine. "
+               "Calling the decision tool with a number the user never gave is "
+               "not -- a hit would be some other company's decision, and a miss "
+               "is a wasted call presented as a search."),
     Spec(query="Што значи големина на субјект?",
          intent="no_tool", live_tool=True,
          # The assertion is the CITATION, not the wording. Forbidding the size

@@ -303,9 +303,18 @@ def forbidden_absent(record: AnswerRecord, case: EvalCase) -> float | None:
                       for alt in v.split("|")) else 1.0
 
 
+# A digit COUNT describes the shape of an identifier -- "деловодниот број е
+# 14-цифрен", "ЕМБС има 7 или 8 цифри" -- not a fact about the registry. It came
+# from the tool contract rather than a document, so treating it as a claim
+# scored a correct "please give me the 14-digit number" as a fabrication.
+_DIGIT_COUNT_RE = re.compile(r"\d+\s*-?\s*цифр\w*", re.IGNORECASE)
+
+
 def numbers_in(text: str) -> list[str]:
-    """Multi-digit numbers stated as claims, ignoring list markers and citations."""
+    """Multi-digit numbers stated as claims, ignoring list markers, citations
+    and digit counts."""
     stripped = _LIST_MARKER_RE.sub("", _CITATION_RE.sub(" ", text))
+    stripped = _DIGIT_COUNT_RE.sub(" ", stripped)
     out = []
     for m in _NUMBER_RE.findall(stripped):
         d = _digits(m)
@@ -347,9 +356,21 @@ def numeric_groundedness(record: AnswerRecord, corpus: Corpus) -> float | None:
         for part in re.split(r"[.,/\-]+", token):
             if len(part) >= 2:
                 available.add(part)
-    # Dates and years the model may legitimately restate from its own framing.
-    grounded = sum(1 for n in stated if n in available)
+    # Identifiers the USER typed. Repeating "ЕМБС 7405855" back is the question,
+    # not a claim the agent sourced -- and when no tool ran there is no document
+    # to find it in, so "I need the деловоден број, an ЕМБС (7405855) is not
+    # enough" scored as half-fabricated.
+    #
+    # Only identifier lengths (ЕМБС 7-8, ЕДБ 13, деловоден број 14). A user who
+    # puts an amount, a deadline or a phone number (9 digits) into a false
+    # premise, and gets it confirmed back, must still be scored as ungrounded:
+    # that echo IS the failure, and this metric is one of the nets for it.
+    asked = {n for n in numbers_in(record.query) if len(n) in _IDENTIFIER_LENGTHS}
+    grounded = sum(1 for n in stated if n in available or n in asked)
     return grounded / len(stated)
+
+
+_IDENTIFIER_LENGTHS = frozenset({7, 8, 13, 14})
 
 
 def value_citation(record: AnswerRecord, case: EvalCase, corpus: Corpus) -> float | None:

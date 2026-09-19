@@ -55,11 +55,15 @@ class EntitySizeArgs(BaseModel):
     The guard matters: without it an invented or malformed ЕМБС reaches a
     government host, and the portal answers a malformed id the same way it
     answers an unknown one.
+
+    No example number in the description. The one that used to be here was a
+    real company's ЕМБС, and a model that copies an example instead of asking
+    the user would look up that company for someone who never mentioned it.
     """
     embs: str = Field(description=(
         "ЕМБС (Единствен матичен број на субјектот) -- the 7- or 8-digit "
-        "registration number of the legal entity, digits only, e.g. '7696876'. "
-        "Keep any leading zero: '07696876' and '7696876' are different inputs."))
+        "registration number of the legal entity, digits only, exactly as the "
+        "user gave it. Never add or remove a leading zero."))
 
     @field_validator("embs")
     @classmethod

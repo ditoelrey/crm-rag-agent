@@ -18,6 +18,10 @@ anyway because a partial answer the agent can give today beats a complete one
 it cannot -- and because the source seam (entity_profile.ProfileSource) means
 the day an official feed arrives, default_source() changes and nothing else does.
 
+Form 3 (Објави на уписи -- a published Решение) runs offline for the same reason
+and in the same way, but is keyed by the 14-digit деловоден број rather than the
+ЕМБС: one entity accumulates many decisions, and the endpoint addresses a filing.
+
 Form 4 (Статус на обработка) is deliberately absent: it sits behind reCAPTCHA,
 and working around bot protection is not on the table. If the registry provides
 an API for it, or the user completes the challenge themselves, it can be added
@@ -25,13 +29,17 @@ here like any other.
 """
 from __future__ import annotations
 
-from . import entity_profile, entity_size
+from . import entity_profile, entity_size, registration_decision
 
-REGISTRY = [entity_size.TOOL_SPEC, entity_profile.TOOL_SPEC]
+REGISTRY = [entity_size.TOOL_SPEC, entity_profile.TOOL_SPEC,
+            registration_decision.TOOL_SPEC]
 
 DISPATCH = {
     "check_entity_size": lambda **kw: entity_size.fetch_entity_size(**kw),
     "get_entity_profile": lambda **kw: entity_profile.fetch_profile(**kw),
+    "get_registration_decision":
+        lambda **kw: registration_decision.fetch_decision(**kw),
 }
 
-__all__ = ["REGISTRY", "DISPATCH", "entity_profile", "entity_size"]
+__all__ = ["REGISTRY", "DISPATCH", "entity_profile", "entity_size",
+           "registration_decision"]

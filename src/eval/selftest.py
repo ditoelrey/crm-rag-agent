@@ -274,6 +274,30 @@ def _answer_tests(c) -> None:
     check("but an invented date is still caught",
           A.numeric_groundedness(invented_date, c), 0.0)
 
+    # Form 3's identifier boundary: given only an ЕМБС, the right reply asks for
+    # the 14-digit деловоден број and cites nothing. Its numbers are a digit
+    # count from the tool contract and the user's own ЕМБС -- neither is a
+    # fabricated registry fact, and the scorer read both as one.
+    def asked(query, text, docs=()):
+        return A.AnswerRecord(case_id="t", query=query, text=text, citations=[],
+                              docs=list(docs))
+    q = "Дај ми го решението за упис за субјектот со ЕМБС 7405855."
+    check("a digit count is not a claim",
+          A.numbers_in("потребен ми е деловодниот број, кој е 14-цифрен број"), [])
+    check("...nor '7 или 8 цифри'", A.numbers_in("ЕМБС има 7 или 8 цифри"), [])
+    check("...but '14 дена' still is", A.numbers_in("рокот е 14 дена"), ["14"])
+    check("the user's own ЕМБС repeated back is grounded", A.numeric_groundedness(
+        asked(q, "ЕМБС (7405855) не е доволен; потребен ми е деловодниот број."),
+        c), 1.0)
+    check("...but a DIFFERENT identifier is not", A.numeric_groundedness(
+        asked(q, "Решението за ЕМБС 7405856 е донесено."), c), 0.0)
+    # The guard on the exemption: a short number from the question is the shape
+    # of a false premise ("the fee is 999?" -> "yes, 999"), and must still fail.
+    check("an amount echoed from a false premise is still ungrounded",
+          A.numeric_groundedness(asked("Дали таксата е 999 денари?",
+                                       "Да, таксата е 999 денари.", [tariff]), c),
+          0.0)
+
     # --- conversations ---------------------------------------------------- #
     mt = cases["Кои се овластените регистрациони агенти во Гостивар?"]
     check("the fabrication case is multi-turn", len(mt.conversation), 3)

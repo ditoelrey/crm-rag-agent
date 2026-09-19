@@ -51,7 +51,6 @@ portal, saves the PNG, and everything downstream is identical.
 """
 from __future__ import annotations
 
-import base64
 import json
 import re
 from dataclasses import dataclass
@@ -67,6 +66,8 @@ from eval.corpus import Block
 from ..context import ContextDoc
 from .entity_size import KNOWN_SIZES, EntitySizeArgs
 from .schema import strict_schema
+from .vision import (MAX_IMAGE_BYTES, VISION_MODEL, ImageCache,  # noqa: F401
+                     extract_structured, read_png)
 
 PROFILE_URL = "https://www.crm.com.mk/CRMPublicPortalApi/api/freeservice/basicProfile/{embs}"
 PAGE_URL = ("https://www.crm.com.mk/mk/otvoreni-podatotsi/"
@@ -83,17 +84,13 @@ SCI = {"screenSizeW": 1536, "screenSizeH": 864, "vpSizeW": 1048, "vpSizeH": 730,
        "scrollOffsetX": 0, "scrollOffsetY": 49, "docWidth": 1033,
        "docHeight": 1482, "isMobile": False, "deviceScaleFactor": 1}
 
-VISION_MODEL = "gpt-4o"
-# gpt-4o prices images as input tokens; one profile table is ~1-1.5k. Cheap per
-# call, but not free per eval run -- which is why the gates replay fixtures.
-MAX_IMAGE_BYTES = 6_000_000
-
 
 class ProfileArgs(BaseModel):
+    # No example number -- see EntitySizeArgs. The old one was ЛОРА's real ЕМБС.
     embs: str = Field(description=(
         "ЕМБС (Единствен матичен број на субјектот) -- the 7- or 8-digit "
-        "registration number, digits only, e.g. '7696876'. Keep any leading "
-        "zero: '07696876' and '7696876' are different inputs."))
+        "registration number, digits only, exactly as the user gave it. Never "
+        "add or remove a leading zero."))
 
 
 class EntityProfile(BaseModel):
@@ -242,30 +239,8 @@ _EXTRACT_PROMPT = (
 def extract_profile(image_bytes: bytes, *, client=None,
                     model: str = VISION_MODEL) -> EntityProfile:
     """Read the profile table out of the PNG. The one non-deterministic step."""
-    if len(image_bytes) > MAX_IMAGE_BYTES:
-        raise ValueError(f"image is {len(image_bytes)} bytes, over the cap")
-    if client is None:
-        import os
-
-        from openai import OpenAI
-        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    resp = client.chat.completions.create(
-        model=model,
-        temperature=0,
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": _EXTRACT_PROMPT},
-            {"type": "image_url",
-             "image_url": {"url": f"data:image/png;base64,{b64}"}},
-        ]}],
-        response_format={"type": "json_schema", "json_schema": {
-            "name": "entity_profile",
-            "schema": strict_schema(EntityProfile),
-            "strict": True,
-        }},
-    )
-    return EntityProfile(**json.loads(resp.choices[0].message.content))
+    return extract_structured(image_bytes, EntityProfile, _EXTRACT_PROMPT,
+                              name="entity_profile", client=client, model=model)
 
 
 def verify_profile(profile: EntityProfile, expect_embs: str) -> list[str]:
@@ -392,10 +367,7 @@ def profile_image_from_file(path: str | Path) -> bytes:
     ЕМБС self-check and citation behave identically whether the bytes arrived
     over the wire or off the disk, so nothing downstream knows which happened.
     """
-    data = Path(path).read_bytes()
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError(f"{path} is not a PNG")
-    return data
+    return read_png(path)
 
 
 class ProfileSource(Protocol):
@@ -430,11 +402,7 @@ class LocalImageSource:
         self.directory = Path(directory)
         self.client = client
         self.pattern = pattern
-        # Vision costs a call and ~3s. The same entity asked about twice in one
-        # session should not pay twice, and the key includes the file's mtime
-        # and size so replacing the PNG invalidates the entry rather than
-        # serving yesterday's read of a file that has changed underneath it.
-        self._cache: dict[tuple[str, int, int], EntityProfile] = {}
+        self._cache = ImageCache()      # see vision.ImageCache
 
     def candidates(self, embs: str) -> list[Path]:
         """Filenames that could hold this entity, padding included.
@@ -452,12 +420,11 @@ class LocalImageSource:
         path = next((p for p in self.candidates(embs) if p.is_file()), None)
         if path is None:
             return None
-        stat = path.stat()
-        key = (str(path), stat.st_mtime_ns, stat.st_size)
-        if key not in self._cache:
-            self._cache[key] = extract_profile(profile_image_from_file(path),
-                                               client=self.client)
-        return self._cache[key]
+        # A lambda, not a bound reference: extract_profile is looked up when
+        # the cache misses, so tests that patch the module attribute still
+        # reach the path they are testing.
+        return self._cache.get(
+            path, lambda data: extract_profile(data, client=self.client))
 
 
 class PortalImageSource:
