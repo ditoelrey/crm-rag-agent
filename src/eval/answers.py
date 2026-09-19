@@ -119,6 +119,11 @@ class AnswerRecord:
     retrieval_ms: float = 0.0
     generation_ms: float = 0.0
     error: str | None = None
+    # Text of context docs that are NOT corpus blocks -- live tool results,
+    # whose chunk_id is synthetic ("tool:entity_size:07696876"). Without
+    # this the scorers resolve citations through corpus.by_id, find
+    # nothing, and report a perfectly grounded live answer as ungrounded.
+    live_docs: dict[str, str] = field(default_factory=dict)
     # Multi-turn: one entry per turn. `text`/`citations` above are the FINAL
     # answer, so every single-turn scorer keeps working unchanged; `docs` is the
     # union across turns, because a fact retrieved on turn 1 is legitimately
@@ -145,6 +150,7 @@ def generate(agent, cases: Sequence[EvalCase], *, progress: bool = True
         agent.reset()
         turns: list[dict] = []
         docs: list[str] = []
+        live_docs: dict[str, str] = {}
         last = None
         error = None
         try:
@@ -161,6 +167,10 @@ def generate(agent, cases: Sequence[EvalCase], *, progress: bool = True
                 for d in a.docs:
                     if d.chunk_id not in docs:
                         docs.append(d.chunk_id)
+                    # Live results are not in the index, so their text has to
+                    # travel with the record or the scorers cannot see it.
+                    if d.chunk_id.startswith("tool:"):
+                        live_docs[d.chunk_id] = d.block.content
         except Exception as e:                     # never lose a whole run
             error = f"{type(e).__name__}: {e}"
 
@@ -169,6 +179,7 @@ def generate(agent, cases: Sequence[EvalCase], *, progress: bool = True
                                     text="", error=error, turns=turns))
         else:
             out.append(AnswerRecord(
+                live_docs=live_docs,
                 case_id=case.case_id, query=case.query, text=last.text,
                 citations=list(last.citations),
                 stale_citations=list(last.stale_citations),
@@ -303,6 +314,19 @@ def numbers_in(text: str) -> list[str]:
     return out
 
 
+def _text_of(record: "AnswerRecord", corpus: Corpus, ids) -> str:
+    """Content of the given chunk_ids, from the corpus or from the record's own
+    live results. Live lookups are real evidence; they just do not live in the
+    index."""
+    out = []
+    for cid in ids:
+        if cid in corpus.by_id:
+            out.append(corpus.by_id[cid].content)
+        elif cid in record.live_docs:
+            out.append(record.live_docs[cid])
+    return " ".join(out)
+
+
 def numeric_groundedness(record: AnswerRecord, corpus: Corpus) -> float | None:
     """Share of the answer's numbers that appear in the retrieved context.
 
@@ -312,8 +336,7 @@ def numeric_groundedness(record: AnswerRecord, corpus: Corpus) -> float | None:
     stated = numbers_in(record.text)
     if not stated:
         return None
-    pool = " ".join(corpus.by_id[cid].content for cid in record.docs
-                    if cid in corpus.by_id)
+    pool = _text_of(record, corpus, record.docs)
     available = set(numbers_in(pool))
     # "15.3." normalises to "153", but an answer that renders it "15 март"
     # states "15" -- which IS in the context, just not as one token. Expose the
@@ -342,8 +365,7 @@ def value_citation(record: AnswerRecord, case: EvalCase, corpus: Corpus) -> floa
     stated = [v for v in case.expect_values if _norm(v) in text]
     if not stated:
         return None
-    cited_text = _norm(" ".join(corpus.by_id[cid].content for cid in record.citations
-                                if cid in corpus.by_id))
+    cited_text = _norm(_text_of(record, corpus, record.citations))
     if not cited_text:
         return 0.0
     return sum(1 for v in stated if _norm(v) in cited_text) / len(stated)

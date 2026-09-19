@@ -92,6 +92,9 @@ class EvalCase:
     # eval will not. A `clarify` case still carries retrieval gold: the agent
     # can only ask an informed question if the competing rows were retrievable.
     expect_behavior: str | None = None
+    # Answered by a LIVE lookup, so it legitimately has no corpus gold:
+    # the fact is fetched at ask-time, not stored in the index.
+    live_tool: bool = False
     # Checkable facts the answer must contain / must not contain. Exact values
     # beat an LLM judge for this class of question: a fee is right or it isn't.
     expect_values: list[str] = field(default_factory=list)
@@ -393,7 +396,8 @@ def validate_cases(cases: Sequence[EvalCase], c: Corpus) -> None:
         if not case.query.strip():
             problems.append(f"{case.case_id}: empty query")
         if (not any(g >= 2 for g in case.gold.values())
-                and case.expect_behavior != "abstain" and not case.is_multi_turn):
+                and case.expect_behavior != "abstain" and not case.is_multi_turn
+                and not case.live_tool):
             problems.append(f"{case.case_id}: no grade-2 (primary) gold item")
         if case.turns and case.turns[0] != case.query:
             problems.append(f"{case.case_id}: turns[0] must equal query")

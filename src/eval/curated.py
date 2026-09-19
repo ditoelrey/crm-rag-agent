@@ -49,6 +49,12 @@ class Spec:
     directory: tuple[tuple[str, str | None], ...] = ()
     values: tuple[str, ...] = ()      # must appear in the answer
     forbid: tuple[str, ...] = ()      # must NOT appear -- usually a near-miss
+    # A TOOL-BOUNDARY case: graded on whether a live lookup happens, not on what
+    # was retrieved. Such a case has no corpus gold by definition -- the fact is
+    # fetched rather than stored, or (for a must-not-call case) there is no fact
+    # to fetch at all -- so it is exempt from the "every answerable case resolves
+    # to blocks" rule, and the retrieval run skips it like any gold-less case.
+    live_tool: bool = False
     # Multi-turn: `query` is turn 1, `followups` are the rest. `values`/`forbid`
     # are asserted on the FINAL answer; `turn_behaviors` grades each turn.
     followups: tuple[str, ...] = ()
@@ -599,6 +605,79 @@ SPECS: list[Spec] = [
                "also be named -- that is correct and not scored, because the "
                "failure was never saying too little about бришење, it was "
                "saying nothing about the document."),
+    # ----------------------------------------------------------------- #
+    # Live tools: the choice boundary.
+    #
+    # These two are a pair and only mean anything together. One question can
+    # ONLY be answered by a live lookup, the other must NEVER trigger one -- and
+    # the second matters more, because a model with a hammer reaches for it, and
+    # that tendency gets worse as Forms 2-3 are added.
+    #
+    # Both run against recorded fixtures (agent/tools/fixtures.py); the eval
+    # only touches the real portal with --live-tools.
+    # ----------------------------------------------------------------- #
+    Spec(query="Која е големината на субјектот со ЕМБС 07696876?",
+         intent="live_lookup", behavior="answer", live_tool=True,
+         values=("мал",),
+         # FORM 1 vs FORM 2. Both tools can answer this -- the profile image
+         # prints Големина too -- so the cheap one has to win on its own merits.
+         # The assertion is the citation: get_entity_profile costs a vision call
+         # and ~3s to return one word that check_entity_size returns for free,
+         # and nothing but this line notices when the model starts preferring it.
+         forbid=("tool:entity_profile",),
+         notes="Answerable ONLY by calling check_entity_size: no corpus block "
+               "holds this company's size. Asserting the value also proves the "
+               "tool ran -- 'мал' cannot be grounded any other way -- and the "
+               "citation it carries must be tool:entity_size:07696876, which "
+               "exercises the whole synthetic-ContextDoc path: the id has to "
+               "reach the model, survive validate_citations, and keep the hard "
+               "abstention guard from replacing a correct answer."),
+    # FORM 2. The profile arrives as a PNG read by gpt-4o Vision, so unlike
+    # every other case here the value under test passed through a probabilistic
+    # step. ЕДБ and the founding date are asserted because they appear NOWHERE
+    # in the corpus -- stating them proves the image was read, and misreading a
+    # digit fails the case rather than quietly shipping a plausible number.
+    Spec(query="Дај ми ги основните податоци за субјектот со ЕМБС 07696876.",
+         intent="live_lookup", behavior="answer", live_tool=True,
+         values=("4058023546097", "19.09.2023"),
+         notes="Exercises the whole Form 2 path end to end: tool choice, the "
+               "vision extraction, the ЕМБС self-check, and the citation. The "
+               "citation half is load-bearing -- the answer is a ten-row list "
+               "and the model omitted the bracket on it often enough that the "
+               "hard-abstention guard replaced a perfectly correct profile with "
+               "'нема информација'. A case that only checked the VALUES would "
+               "have scored that failure as a pass."),
+    Spec(query="Дај ми го основниот профил за субјектот со ЕМБС 7405855.",
+         intent="live_lookup", live_tool=True,
+         # Cross-contamination is the failure that matters here: the ONLY
+         # profile this agent holds is ЛОРА's, so an answer about a different
+         # ЕМБС that contains ЛОРА's ЕДБ or name has served one company's data
+         # under another company's number -- which looks entirely plausible and
+         # is the single worst thing this tool can do.
+         forbid=("4058023546097", "ЛОРА"),
+         notes="No saved image for this entity, so Form 2 must report it as "
+               "unavailable rather than improvise. Behaviour is NOT graded: "
+               "'профилот не е достапен' sits between answer and abstain and "
+               "the distinction is not what this case is about. What it is "
+               "about is that the reply carries no other entity's fields, and "
+               "that a miss stays a returned value -- an exception here would "
+               "take down the turn instead of answering it."),
+    Spec(query="Што значи големина на субјект?",
+         intent="no_tool", live_tool=True,
+         # The assertion is the CITATION, not the wording. Forbidding the size
+         # words themselves does not work: "голем" is a substring of "големина",
+         # the question's own noun, so the case failed itself. A tool:entity_size
+         # citation can only exist if the lookup ran, which is exactly and only
+         # what this case is about.
+         forbid=("tool:entity_size",),
+         notes="The tool-choice boundary, and the half that degrades quietly as "
+               "Forms 2-3 are added: a model with more hammers reaches for them. "
+               "This question is about a CONCEPT and names no entity, so a live "
+               "lookup cannot answer it -- there is nothing to look up. Behaviour "
+               "is deliberately NOT graded: the corpus mentions 'големина на "
+               "субјект' only as a field listed on a certificate (2191) and never "
+               "defines the classes, so answer-vs-abstain is a judgement call "
+               "this case has no business freezing. Calling the tool is not."),
 ]
 
 
@@ -649,7 +728,8 @@ def expand(c: Corpus) -> list[EvalCase]:
                     f"blocks for {municipality!r} list={list_key!r}")
             primary += [b.chunk_id for b in blocks]
 
-        if not primary and s.behavior != "abstain" and not s.followups:
+        if (not primary and s.behavior != "abstain" and not s.followups
+                and not s.live_tool):
             raise ValueError(f"curated case {i}: no gold resolved")
 
         if not s.pin_provenance:
@@ -670,6 +750,7 @@ def expand(c: Corpus) -> list[EvalCase]:
             family=f"curated_{s.intent}",
             source="curated",
             gold=gold,
+            live_tool=s.live_tool,
             expect_service=s.service,
             expect_variation=s.variation,
             expect_types=list(s.types) or _types_of(c, primary),

@@ -223,8 +223,14 @@ def cmd_answer(args) -> int:
     else:
         from agent.agent import CRMAgent
         try:
+            # Live tools are OFF by default. Every eval run would otherwise
+            # POST to a government host, and a gate that can fail because
+            # someone else's server is down is a gate people stop trusting.
+            dispatch = None
+            if not args.live_tools:
+                from agent.tools.fixtures import DISPATCH as dispatch
             agent = CRMAgent(corpus=c, model=args.model, k=args.k,
-                             timeout=args.timeout)
+                             timeout=args.timeout, dispatch=dispatch)
         except RuntimeError as e:
             print(str(e), file=sys.stderr)
             return 2
@@ -377,6 +383,9 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--save", help="where to write the generated answers")
     a.add_argument("--from", dest="from_file",
                    help="re-score saved answers instead of calling the model")
+    a.add_argument("--live-tools", action="store_true",
+                   help="hit the real CRM portal for tool calls instead of "
+                        "replaying recorded fixtures")
     a.add_argument("--judge", action="store_true",
                    help="add an LLM groundedness pass (opt-in: not reproducible)")
     a.add_argument("--judge-model", default="gpt-4o-mini")

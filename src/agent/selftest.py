@@ -52,9 +52,14 @@ class StubClient:
     def __init__(self, reply: str = "Одговор [X]."):
         self.reply = reply
         self.calls: list[list[dict]] = []
+        self.offered_tools: list | None = None
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    def _create(self, *, model, messages, temperature):
+    # `tools` is accepted because the real client is now called with it. A stub
+    # whose signature drifts from the thing it stands in for stops testing the
+    # code path it is supposed to cover.
+    def _create(self, *, model, messages, temperature, tools=None):
+        self.offered_tools = tools
         self.calls.append(messages)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=self.reply))],
@@ -447,6 +452,298 @@ def _clarification_tests(c) -> None:
                not is_followup("Дај ми список на адвокати во Прилеп"))
 
 
+def _tool_tests(c) -> None:
+    """The live-lookup loop, driven entirely from fixtures.
+
+    No network and no API key: DISPATCH is injectable for exactly this reason.
+    A gate that needs a government portal to be up is a gate people stop running.
+    """
+    print("[tools]")
+    from types import SimpleNamespace
+
+    from .tools.entity_size import (EntitySize, EntitySizeArgs, TOOL_SPEC,
+                                    parse_entity_size)
+    from bs4 import BeautifulSoup
+
+    # --- parsing, against the markup the live form actually returns --------- #
+    html = ('<span id="ctl00_cphMain_ucCheckLeSize_LblResult">'
+            'Големината на правниот субјект е: мал        </span>')
+    got = parse_entity_size(BeautifulSoup(html, "html.parser"),
+                            "07696876", "2026-09-18T00:00:00+00:00")
+    check("the size class is read out", got.size, "мал")
+    check("trailing whitespace is collapsed", got.message,
+          "Големината на правниот субјект е: мал")
+    # An unknown entity must NOT be confused with a broken integration: this
+    # returns found=False, while a missing span raises. See parse_entity_size.
+    unknown = parse_entity_size(BeautifulSoup(
+        html.replace("Големината на правниот субјект е: мал",
+                     "Не е пронајден субјект"), "html.parser"), "9999999", "t")
+    check("an unknown entity is not a size", unknown.size, None)
+    check_true("...and is reported as not found", not unknown.found)
+    try:
+        parse_entity_size(BeautifulSoup("<div>nothing</div>", "html.parser"),
+                          "1234567", "t")
+        check_true("a missing result span raises rather than returning empty", False)
+    except RuntimeError:
+        check_true("a missing result span raises rather than returning empty", True)
+
+    # --- the ЕМБС guard: an invented id must never reach the portal --------- #
+    for bad in ("123", "abcdefgh", "123456789"):
+        try:
+            EntitySizeArgs(embs=bad)
+            check_true(f"{bad!r} is rejected before any request", False)
+        except Exception:
+            check_true(f"{bad!r} is rejected before any request", True)
+    check("a leading zero is never stripped", EntitySizeArgs(embs="07696876").embs,
+          "07696876")
+
+    # --- strict-mode schema hygiene ---------------------------------------- #
+    params = TOOL_SPEC["function"]["parameters"]
+    check_true("strict mode needs additionalProperties=false",
+               params.get("additionalProperties") is False)
+    check_true("the class docstring does not leak to the model",
+               "description" not in params)
+
+    # --- the loop ----------------------------------------------------------- #
+    fixture = EntitySize(embs="07696876", size="мал",
+                         message="Големината на правниот субјект е: мал",
+                         fetched_at="2026-09-18T00:00:00+00:00", found=True)
+    calls = {"n": 0}
+
+    def fake_lookup(**kw):
+        calls["n"] += 1
+        return fixture
+
+    class ToolThenAnswer:
+        """Asks for the lookup once, then answers citing what it was given."""
+
+        def __init__(self):
+            self.turn = 0
+            self.seen_tool_content: list[str] = []
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create))
+
+        def _create(self, *, model, messages, temperature, tools=None):
+            self.turn += 1
+            usage = SimpleNamespace(prompt_tokens=100, completion_tokens=20)
+            if self.turn == 1:
+                check_true("tools are offered to the model", bool(tools))
+                call = SimpleNamespace(
+                    id="call_1",
+                    function=SimpleNamespace(name="check_entity_size",
+                                             arguments='{"embs": "07696876"}'))
+                msg = SimpleNamespace(content=None, tool_calls=[call])
+                return SimpleNamespace(choices=[SimpleNamespace(message=msg)],
+                                       usage=usage)
+            self.seen_tool_content = [m["content"] for m in messages
+                                      if isinstance(m, dict) and m.get("role") == "tool"]
+            msg = SimpleNamespace(
+                content="Големината е мал [tool:entity_size:07696876].",
+                tool_calls=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=msg)], usage=usage)
+
+    client = ToolThenAnswer()
+    agent = CRMAgent(corpus=c, retriever=StubRetriever(
+        [b.chunk_id for b in c.by_service[2135] if b.type == "tariffs"][:3]),
+        client=client, dispatch={"check_entity_size": fake_lookup},
+        tools=[TOOL_SPEC])
+    a = agent.ask("Која е големината на субјектот со ЕМБС 07696876?")
+
+    check("the tool ran exactly once", calls["n"], 1)
+    check("the call is recorded on the Answer", a.tool_calls, ["check_entity_size"])
+    check_true("the model is told the citation id",
+               any("tool:entity_size:07696876" in c_ for c_ in client.seen_tool_content),
+               "without it the answer cannot be cited and the guard deletes it")
+    # The whole point: a live result must survive validate_citations AND the
+    # hard-abstention guard, which replaces any answer carrying no valid id.
+    check("the live citation validates", a.citations, ["tool:entity_size:07696876"])
+    check("...and nothing is flagged fabricated", a.invalid_citations, [])
+    check_true("the answer is not replaced by the abstention guard",
+               a.text.startswith("Големината е мал"), a.text[:60])
+    check_true("the tool doc joins the context",
+               any(d.chunk_id == "tool:entity_size:07696876" for d in a.docs))
+    check_true("a repeat citation next turn would be stale, not fabricated",
+               "tool:entity_size:07696876" in agent.seen_docs)
+    check("both rounds are billed", a.prompt_tokens, 200)
+
+    # State isolation: a tool_calls message in history breaks the NEXT request,
+    # because OpenAI requires every tool_call_id to be answered in the same list
+    # and history is both trimmed and truncated.
+    check("history keeps only the user/assistant pair", len(agent.history), 2)
+    check_true("no tool scaffolding leaks into history",
+               all(isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                   and "tool_calls" not in m for m in agent.history))
+
+
+def _profile_tool_tests(c) -> None:
+    """Form 2: the vision extraction's self-checks, with no model and no network.
+
+    What cannot be tested here is whether gpt-4o reads the PNG correctly -- that
+    needs the model and a real image. What CAN be tested, and matters more, is
+    everything that decides what happens when it reads it wrong.
+    """
+    print("[entity profile]")
+    from .tools.entity_profile import (ASSETS, TEMPLATE_PATH, LocalImageSource,
+                                       ProfileMismatch, ProfileResult,
+                                       ProfileUnavailable, TOOL_SPEC,
+                                       _same_embs, fetch_profile,
+                                       profile_image_from_file, verify_profile)
+    from .tools.fixtures import RECORDED_PROFILES, _FixtureSource
+
+    # The real read of agent/tools/assets/basic_profile_7696876.png, verified
+    # field by field against the picture and kept in fixtures.py. Reused here so
+    # there is ONE recording of that entity: a second copy in the test file
+    # would drift from the one the eval replays and nothing would notice.
+    good = RECORDED_PROFILES["7696876"]
+
+    check("a clean read raises no shape problems", verify_profile(good, "7696876"), [])
+    check_true("a short ЕДБ is caught",
+               bool(verify_profile(good.model_copy(update={"edb": "405802"}), "7696876")))
+    check_true("a reformatted date is caught",
+               bool(verify_profile(good.model_copy(update={"founded": "2023-09-19"}),
+                                   "7696876")))
+    check_true("an invented size class is caught",
+               bool(verify_profile(good.model_copy(update={"size": "средно"}),
+                                   "7696876")))
+
+    # Zero padding: the registry prints 7696876 and accepts 07696876 for the
+    # same company, so a strict comparison would reject a CORRECT profile.
+    check_true("zero padding does not count as a different entity",
+               _same_embs("07696876", "7696876"))
+    check_true("...but a different number does",
+               not _same_embs("7405855", "7696876"))
+
+    # The check that earns the vision step: a profile for the wrong company is
+    # worse than no profile, because every field in it looks plausible.
+    def wrong_entity(image_bytes, **kw):
+        return good.model_copy(update={"embs": "7405855"})
+
+    import agent.tools.entity_profile as ep
+    png = ASSETS / "basic_profile_7696876.png"
+    real_extract = ep.extract_profile
+    ep.extract_profile = wrong_entity
+    try:
+        fetch_profile("7696876", image_path=png)
+        check_true("a mismatched profile is refused, not returned", False)
+    except ProfileMismatch:
+        check_true("a mismatched profile is refused, not returned", True)
+    finally:
+        ep.extract_profile = real_extract
+
+    # ACQUISITION. Form 2 sits behind reCAPTCHA v3 and this module does not go
+    # looking for a token, so the offline source is the working one and a miss
+    # has to be an ANSWER rather than a crash or an unauthorised retry.
+    check_true("the saved-PNG path reads the asset",
+               profile_image_from_file(png).startswith(b"\x89PNG"))
+    try:
+        profile_image_from_file(TEMPLATE_PATH)
+        check_true("a non-PNG is rejected", False)
+    except ValueError:
+        check_true("a non-PNG is rejected", True)
+    check_true("the render template is on disk for the live path",
+               TEMPLATE_PATH.exists() and "[^$.LEID^]" in
+               TEMPLATE_PATH.read_text(encoding="utf-8"))
+
+    # An entity nobody has saved. This is the common case in production, so it
+    # is the one that must not raise: the tool loop hands whatever comes back to
+    # the model, and an exception here takes down the whole turn.
+    miss = fetch_profile("1234567", source=_FixtureSource())
+    check_true("an unheld entity returns a value, not an exception",
+               isinstance(miss, ProfileUnavailable))
+    check("...flagged unavailable", miss.available, False)
+    check("...with a machine-readable reason", miss.reason, "no_local_image")
+    check_true("...and a Macedonian message to relay",
+               "не е достапен" in miss.message)
+    # The guard deletes any answer that cites nothing, so the miss must be
+    # citable or an honest "we do not hold that" gets replaced by boilerplate.
+    mdoc = miss.as_context_doc()
+    check("an unavailable profile is still citable", mdoc.chunk_id,
+          "tool:entity_profile:1234567:unavailable")
+    check_true("...and cannot be mistaken for profile data",
+               "ЕДБ:" not in mdoc.block.content
+               and "Големина:" not in mdoc.block.content)
+    check_true("both result shapes expose `available` for the model to branch on",
+               "available" in miss.model_dump()
+               and ProfileResult(profile=good, fetched_at="x").available is True)
+
+    # PADDING. The registry prints 7696876, users type 07696876, and the
+    # operator saving the PNG picks one. Making the human guess which spelling
+    # the cache wants is how a profile that is present reads as missing.
+    src = LocalImageSource(ASSETS)
+    for spelling in ("7696876", "07696876"):
+        check_true(f"{spelling} resolves to the saved image",
+                   any(p.is_file() for p in src.candidates(spelling)))
+
+    # THE MIGRATION POINT. A source that returns fields with no image and no
+    # vision call must satisfy the same contract, or "swap the transport later"
+    # is a promise the seam cannot keep.
+    class _FieldsOnly:
+        name = "api:test"
+
+        def load(self, embs):
+            return good.model_copy(update={"embs": embs})
+
+    api = fetch_profile("07696876", source=_FieldsOnly())
+    check("a fields-only transport needs no vision step", api.source, "api:test")
+    check_true("...and produces the same citable shape",
+               api.as_context_doc().chunk_id.startswith("tool:entity_profile:")
+               and "Големина: мал" in api.as_context_doc().block.content)
+    # Validation is source-independent: an API can transpose a digit too.
+    bad_api = type("_BadApi", (), {
+        "name": "api:bad",
+        "load": lambda self, embs: good.model_copy(update={"edb": "405"})})()
+    try:
+        fetch_profile("7696876", source=bad_api)
+        check_true("shape checks run whatever the source", False)
+    except ValueError:
+        check_true("shape checks run whatever the source", True)
+
+    # Everything the user could be told must be in the citable text, or
+    # numeric_groundedness reads a correctly-copied ЕДБ as a fabrication.
+    doc = ProfileResult(profile=good, fetched_at="2026-09-18T12:00:00+00:00"
+                        ).as_context_doc()
+    check("the profile is citable", doc.chunk_id, "tool:entity_profile:7696876")
+    for label, value in (("ЕМБС", "7696876"), ("ЕДБ", "4058023546097"),
+                         ("датум", "19.09.2023"), ("големина", "мал"),
+                         ("целосен назив", "ЛОРА КОМПАНИ 2023 ДОО Скопје")):
+        check_true(f"{label} survives into the citable text", value in doc.block.content)
+    # The user's padded spelling must be groundable too -- the image prints
+    # 7696876, and an answer opening "субјектот со ЕМБС 07696876" was scored
+    # as citing a number its source never contained.
+    padded = ProfileResult(profile=good, fetched_at="x",
+                           requested_embs="07696876").as_context_doc()
+    check_true("the ЕМБС as asked is in the citable text",
+               "07696876" in padded.block.content
+               and "ЕМБС: 7696876" in padded.block.content)
+    check_true("...and is not repeated when it matches the image",
+               "Побаран" not in doc.block.content)
+    # An absent row prints nothing rather than an empty label: a bare
+    # "Дополнителни податоци:" reads as a fact the registry stated and did not.
+    check_true("an absent row leaves no empty label behind",
+               "Дополнителни податоци" not in doc.block.content)
+
+    params = TOOL_SPEC["function"]["parameters"]
+    check_true("strict schema on the profile tool too",
+               params.get("additionalProperties") is False
+               and "description" not in params)
+
+    # REGISTRATION. The live registry and the fixture registry must offer the
+    # same tools: a gate that replays a tool production does not expose, or
+    # misses one it does, is measuring a different agent than the one shipping.
+    from .tools import DISPATCH as LIVE_DISPATCH, REGISTRY
+    from .tools.fixtures import DISPATCH as FIXTURE_DISPATCH
+    names = [t["function"]["name"] for t in REGISTRY]
+    check_true("Form 2 is registered", "get_entity_profile" in names)
+    check("every registered tool is dispatchable",
+          sorted(names), sorted(LIVE_DISPATCH))
+    check("...and every one has a fixture for the gates",
+          sorted(FIXTURE_DISPATCH), sorted(LIVE_DISPATCH))
+    check_true("the tool tells the model to prefer the cheaper size lookup",
+               "check_entity_size" in TOOL_SPEC["function"]["description"])
+    check_true("...and not to retry an unavailable profile",
+               "available=false" in TOOL_SPEC["function"]["description"])
+
+
 def _orchestration_tests(c) -> None:
     print("[orchestration]")
     tariffs = [b.chunk_id for b in c.by_service[2135] if b.type == "tariffs"][:5]
@@ -707,7 +1004,8 @@ def main() -> int:
     print(f"corpus: {len(c)} blocks, sha={c.sha256[:12]}\n")
     for stage in (_dedup_tests, _ambiguity_tests, _structure_ambiguity_tests,
                   _structured_fetch_tests, _citation_tests, _clarification_tests,
-                  _injection_tests, _orchestration_tests):
+                  _injection_tests, _tool_tests, _profile_tool_tests,
+                  _orchestration_tests):
         try:
             stage(c)
         except Exception:

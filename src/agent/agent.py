@@ -20,6 +20,7 @@ Both steps are deterministic; neither costs an extra model call.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 import unicodedata
@@ -69,6 +70,9 @@ HISTORY_ANSWER_CHARS = 500
 # Hits requested per document wanted. Dedup collapses byte-identical copies, and
 # without over-fetching a k=10 turn can arrive with only 2 documents.
 OVERFETCH = 4
+# Tool rounds per turn. A model that keeps re-calling a failing lookup would
+# otherwise burn the whole turn; three is enough for call -> correct -> answer.
+MAX_TOOL_ROUNDS = 3
 
 # A follow-up is only treated as one on a strong signal: mis-classifying a real
 # question as a follow-up glues an unrelated topic onto the query, while missing
@@ -116,6 +120,7 @@ class Answer:
     cost_usd: float = 0.0
     retrieval_ms: float = 0.0
     generation_ms: float = 0.0
+    tool_calls: list[str] = field(default_factory=list)
 
     @property
     def asked_for_clarification(self) -> bool:
@@ -131,7 +136,17 @@ class Answer:
 # that count as saying so; anything else with no citation is replaced outright.
 _ABSTAIN_MARKERS = ("нема информација", "немам информација", "не располагам",
                     "не постои информација", "не е наведено", "нема податоци",
-                    "не можам да", "не се наведени")
+                    "не можам да", "не се наведени",
+                    # A live lookup that HELD nothing. Measured at 1 citation in
+                    # 3 runs, the model states this correctly and forgets the
+                    # bracket -- and the guard then replaced an accurate "we
+                    # cannot reach that profile" with "the documentation has no
+                    # information", which is a different and false claim. Safe
+                    # to admit: saying a thing is unavailable asserts nothing
+                    # about the registry's contents, which is what the guard
+                    # exists to keep ungrounded.
+                    "не е достапен", "не е достапна", "не е достапно",
+                    "не се достапни")
 HARD_ABSTENTION = ("Во документацијата со која располагам нема информација "
                    "за ова прашање.")
 
@@ -212,7 +227,8 @@ class CRMAgent:
                  temperature: float = DEFAULT_TEMPERATURE,
                  dedup: bool = True, aliases: bool = True,
                  structured: bool = True, timeout: float = DEFAULT_TIMEOUT,
-                 api_key: str | None = None, client=None):
+                 api_key: str | None = None, client=None,
+                 tools: list[dict] | None = None, dispatch: dict | None = None):
         self.corpus = corpus or load_corpus()
         if retriever is None:
             from index.hybrid import HybridRetriever
@@ -237,6 +253,15 @@ class CRMAgent:
                     "  PowerShell (persistent): setx OPENAI_API_KEY '<your key>'")
             client = OpenAI(api_key=key, max_retries=3, timeout=timeout)
         self.client = client
+
+        # Live lookups. Injectable so the answer eval and the selftest can drive
+        # the loop from fixtures instead of a government API -- the same reason
+        # the retriever and the OpenAI client are injectable.
+        if tools is None or dispatch is None:
+            from .tools import DISPATCH, REGISTRY
+            tools = REGISTRY if tools is None else tools
+            dispatch = DISPATCH if dispatch is None else dispatch
+        self.tools, self.dispatch = tools, dispatch
 
         self.history: list[dict[str, str]] = []
         # Every document shown in this conversation, so a citation repeated from
@@ -351,6 +376,105 @@ class CRMAgent:
                       prompt_tokens=0, completion_tokens=0, cost_usd=0.0,
                       retrieval_ms=retrieval_ms, generation_ms=0.0)
 
+    def _run_tool(self, call, docs: list[ContextDoc]) -> str:
+        """Execute one tool call and return the JSON the model will read.
+
+        Two failure classes, handled differently on purpose:
+
+          * the model supplied a bad argument (a 5-digit ЕМБС) -> hand the
+            complaint back so it can ask the user for a real one. That is a
+            legitimate self-correction and the model is the right place to fix
+            it.
+          * the lookup itself broke -- markup moved, handshake rejected, host
+            down -> RAISE. Letting the model narrate around a dead integration
+            is how you ship "нема информација" for six weeks without noticing,
+            and it is the exact failure the missing-span check exists to expose.
+        """
+        from pydantic import ValidationError
+
+        fn = self.dispatch.get(call.function.name)
+        if fn is None:
+            return json.dumps({"error": f"unknown tool {call.function.name}"},
+                              ensure_ascii=False)
+        try:
+            args = json.loads(call.function.arguments or "{}")
+        except json.JSONDecodeError as e:
+            return json.dumps({"error": f"malformed arguments: {e}"},
+                              ensure_ascii=False)
+        try:
+            result = fn(**args)
+        except ValidationError as e:
+            return json.dumps(
+                {"error": "невалиден влез", "detail": e.errors()[0]["msg"]},
+                ensure_ascii=False)
+
+        # The result becomes citable. validate_citations() reads the allowed set
+        # from `docs`, so appending here -- before validation runs -- is what
+        # makes a live answer survive the hard-abstention guard.
+        doc = result.as_context_doc(rank=len(docs) + 1)
+        docs.append(doc)
+
+        # The model cannot cite an id it has never seen. Without this the answer
+        # is correct, carries no citation, and the guard replaces it wholesale.
+        #
+        # FIRST key, not appended. Observed with the profile tool: its payload
+        # nests eleven fields under `profile`, and with citation_id trailing
+        # after them gpt-4o rendered a flawless ten-row answer and cited
+        # nothing -- so the guard replaced a correct answer with the abstention.
+        # The flat size payload never showed this because the id sat two keys in.
+        #
+        # The directive rides WITH the data rather than only in the system
+        # prompt. Measured on the profile tool: key-ordering alone left 1 answer
+        # in 5 uncited, and an uncited answer is not a degraded answer -- the
+        # guard deletes it and substitutes the abstention, so a correct ten-row
+        # profile reaches the user as "нема информација". A rule 60 lines up the
+        # context competes with the payload for attention; this does not.
+        payload = {"citation_id": doc.chunk_id,
+                   "_note": f"Задолжително наведи [{doc.chunk_id}] во одговорот.",
+                   **result.model_dump()}
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _generate(self, messages: list[dict], docs: list[ContextDoc]):
+        """One model call, or several if it asks for live data.
+
+        `messages` is intra-turn scratch and is thrown away afterwards. Nothing
+        from the tool exchange may reach self.history: OpenAI requires every
+        tool_call_id to be answered inside the same message list, and history is
+        both trimmed (MAX_HISTORY_TURNS) and truncated (_for_history), either of
+        which would orphan the pairing -- and the resulting error surfaces a turn
+        later than its cause.
+        """
+        p_tok = c_tok = 0
+        tool_calls: list[str] = []
+        for _ in range(MAX_TOOL_ROUNDS):
+            kwargs = {"model": self.model, "messages": messages,
+                      "temperature": self.temperature}
+            if self.tools:
+                kwargs["tools"] = self.tools
+            resp = self.client.chat.completions.create(**kwargs)
+            usage = getattr(resp, "usage", None)
+            p_tok += getattr(usage, "prompt_tokens", 0) or 0
+            c_tok += getattr(usage, "completion_tokens", 0) or 0
+
+            choice = resp.choices[0]
+            calls = getattr(choice.message, "tool_calls", None)
+            if not calls:
+                return resp, p_tok, c_tok, tool_calls
+
+            messages.append(choice.message)
+            for call in calls:
+                tool_calls.append(call.function.name)
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": self._run_tool(call, docs)})
+        # Out of rounds: answer from whatever it has rather than looping forever.
+        kwargs = {"model": self.model, "messages": messages,
+                  "temperature": self.temperature}
+        resp = self.client.chat.completions.create(**kwargs)
+        usage = getattr(resp, "usage", None)
+        p_tok += getattr(usage, "prompt_tokens", 0) or 0
+        c_tok += getattr(usage, "completion_tokens", 0) or 0
+        return resp, p_tok, c_tok, tool_calls
+
     def ask(self, message: str) -> Answer:
         retrieval_query, filters = self._plan_retrieval(message)
 
@@ -383,8 +507,7 @@ class CRMAgent:
         messages.append({"role": "user", "content": message})
 
         t1 = time.perf_counter()
-        resp = self.client.chat.completions.create(
-            model=self.model, messages=messages, temperature=self.temperature)
+        resp, p_tok, c_tok, tool_calls = self._generate(messages, docs)
         generation_ms = (time.perf_counter() - t1) * 1000
 
         text = (resp.choices[0].message.content or "").strip()
@@ -403,9 +526,6 @@ class CRMAgent:
             stale, invalid = [], []
         self.seen_docs.update(d.chunk_id for d in docs)
 
-        usage = getattr(resp, "usage", None)
-        p_tok = getattr(usage, "prompt_tokens", 0) or 0
-        c_tok = getattr(usage, "completion_tokens", 0) or 0
         in_price, out_price = PRICING.get(self.model, (0.0, 0.0))
         cost = (p_tok * in_price + c_tok * out_price) / 1_000_000
         self.total_cost_usd += cost
@@ -432,6 +552,7 @@ class CRMAgent:
             retrieval_query=retrieval_query, filters=filters, model=self.model,
             prompt_tokens=p_tok, completion_tokens=c_tok, cost_usd=cost,
             retrieval_ms=retrieval_ms, generation_ms=generation_ms,
+            tool_calls=tool_calls,
         )
 
     def reset(self) -> None:
