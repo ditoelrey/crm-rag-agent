@@ -14,6 +14,9 @@ Pass `--live-tools` to the answer eval to hit the real portal instead.
 """
 from __future__ import annotations
 
+from .announcement_search import search_announcements
+from .entity_search import EntityHit, search_entity_profile
+from .status_info import StatusInfo, fetch_status
 from .entity_profile import (EntityProfile, ProfileResult, ProfileUnavailable,
                              fetch_profile)
 from .entity_size import EntitySize
@@ -145,8 +148,84 @@ def fixture_decision(deloveden_broj: str) -> DecisionResult | DecisionUnavailabl
     return fetch_decision(deloveden_broj, source=_FixtureDecisionSource())
 
 
+# Form 4. Operator-supplied: what the portal's infobox showed for this filing,
+# captured by hand (the entity name was supplied separately, after the first
+# capture redacted it).
+#
+# The same four values are saved as assets/status_30120260014978.json, which is
+# what the PRODUCTION tool reads -- the gates read this dict instead, so they
+# never depend on what an operator has or has not saved. Two copies means two
+# places to drift, so the selftest asserts they are identical.
+RECORDED_STATUS = {
+    "30120260014978": StatusInfo(
+        entity_title=("Трговец поединец за поставување на подни и ѕидни облоги "
+                      "ДРАГИ АЛЕКСА ЈОВАНОВ-БЕКАТОН ЕЛИТ ТП Пробиштип"),
+        publication_date="18.9.2026 18:45",
+        document_description="Упис на основање", status="Одлучен - одобрен"),
+}
+
+
+class _FixtureStatusSource:
+    name = "fixture"
+
+    def load(self, document_id: str):
+        return RECORDED_STATUS.get(document_id)
+
+
+def fixture_status(**kw):
+    return fetch_status(**kw, source=_FixtureStatusSource())
+
+
+class _FixtureEntityIndex:
+    """Entities the gates know about: the recorded profile, plus the entity the
+    recorded decision names. The second is the case that matters -- ТОПОЛЧАН
+    АГРАР is findable by name with no profile saved, so `has_profile` is False
+    and the agent is expected to say so rather than fetch."""
+    name = "fixture"
+
+    def entities(self):
+        hits = {}
+        for embs, profile in RECORDED_PROFILES.items():
+            hits[embs.lstrip("0")] = EntityHit(
+                embs=profile.embs, full_name=profile.full_name,
+                has_profile=True, seen_in=["профил"])
+        for decision in RECORDED_DECISIONS.values():
+            key = decision.embs.lstrip("0")
+            if key in hits:
+                hits[key].seen_in.append("решение")
+            else:
+                hits[key] = EntityHit(embs=decision.embs,
+                                      full_name=decision.full_name,
+                                      has_profile=False, seen_in=["решение"])
+        return list(hits.values())
+
+
+def fixture_entity_search(**criteria):
+    return search_entity_profile(**criteria, index=_FixtureEntityIndex())
+
+
+class _FixtureIndex:
+    """The searchable archive during gates: the recordings above, nothing else.
+
+    Deliberately the same content the fixture decision source serves, so a
+    search hit is always fetchable in the same run -- the property the live
+    offline index has by construction, kept true here instead of assumed.
+    """
+    name = "fixture"
+
+    def all_decisions(self):
+        return list(RECORDED_DECISIONS.values())
+
+
+def fixture_search(**criteria):
+    return search_announcements(**criteria, index=_FixtureIndex())
+
+
 DISPATCH = {
     "check_entity_size": lambda **kw: fixture_entity_size(**kw),
     "get_entity_profile": lambda **kw: fixture_profile(**kw),
     "get_registration_decision": lambda **kw: fixture_decision(**kw),
+    "search_announcements": lambda **kw: fixture_search(**kw),
+    "search_entity_profile": lambda **kw: fixture_entity_search(**kw),
+    "get_status_info": lambda **kw: fixture_status(**kw),
 }

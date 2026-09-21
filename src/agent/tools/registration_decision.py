@@ -9,9 +9,12 @@ Forms 1 and 2 are keyed by the entity. This one is keyed by the FILING: the
 endpoint is `announcement/oss/{деловоден број}`, a 14-digit number, and one
 entity accumulates many decisions over its life. So the tool takes the
 деловоден број and nothing else, and an ЕМБС handed to it fails validation
-before anything runs -- the model is then told why and asks the user for the
-number. It must never invent one: a fabricated filing number either misses (a
-wasted turn) or, worse, hits some other company's decision.
+before anything runs. It must never invent one: a fabricated filing number
+either misses (a wasted turn) or, worse, hits some other company's decision.
+
+announcement_search.search_announcements resolves an entity, a name or a date
+to the numbers this tool takes, so "решенијата за ЕМБС X" is two rounds --
+search, then fetch -- rather than a guess.
 
 THE SCHEMA IS NOT A TEMPLATE
 ----------------------------
@@ -301,11 +304,24 @@ class LocalDecisionSource:
         return self.directory / self.pattern.format(number=deloveden_broj)
 
     def load(self, deloveden_broj: str) -> RegistrationDecision | None:
+        """The decision saved under this number, re-read once if it disagrees.
+
+        The filename is an independent claim about which filing this is, so a
+        printed number that differs from it means one of the two is wrong. The
+        measured cause is usually the read: gpt-4o transposed two digits of a
+        деловоден број in one read out of four of the same image. One re-read
+        settles it cheaply, and a disagreement that survives is left to the
+        caller -- fetch_decision refuses it, the index skips it. Neither
+        rewrites the extracted value to match the filename.
+        """
         path = self.path_for(deloveden_broj)
         if not path.is_file():
             return None
-        return self._cache.get(
-            path, lambda data: extract_decision(data, client=self.client))
+        read = lambda data: extract_decision(data, client=self.client)  # noqa: E731
+        decision = self._cache.get(path, read)
+        if _digits(decision.deloveden_broj) != _digits(deloveden_broj):
+            decision = self._cache.refresh(path, read)
+        return decision
 
 
 _DEFAULT_SOURCE: DecisionSource | None = None
@@ -368,10 +384,12 @@ TOOL_SPEC = {
             "Го враќа објавеното решение за упис од Централниот регистар според "
             "неговиот ДЕЛОВОДЕН БРОЈ (14 цифри): вид на "
             "упис, датум, субјект (ЕМБС и назив) и сите податоци од решението. "
-            "Користи го САМО кога корисникот дал деловоден број. ЕМБС (7-8 "
-            "цифри) НЕ е деловоден број: ако корисникот дал само ЕМБС, побарај "
-            "го деловодниот број од решението и НИКОГАШ не измислувај деловоден "
-            "број. За големина или основен профил на субјект користи "
+            "Користи го САМО со деловоден број. ЕМБС (7-8 цифри) НЕ е деловоден "
+            "број: ако корисникот дал само ЕМБС, назив или датум, прво повикај "
+            "search_announcements за да го добиеш деловодниот број, па потоа "
+            "овој алат. НИКОГАШ не измислувај деловоден број и не користи број "
+            "од пример или од претходно прашање. За големина или основен профил "
+            "на субјект користи "
             "check_entity_size или get_entity_profile. Ако одговорот има "
             "available=false, решението не е достапно -- пренеси ја пораката на "
             "корисникот и НЕ го повикувај алатот повторно за истиот број."),

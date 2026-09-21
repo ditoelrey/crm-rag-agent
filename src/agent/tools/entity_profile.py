@@ -423,8 +423,14 @@ class LocalImageSource:
         # A lambda, not a bound reference: extract_profile is looked up when
         # the cache misses, so tests that patch the module attribute still
         # reach the path they are testing.
-        return self._cache.get(
-            path, lambda data: extract_profile(data, client=self.client))
+        read = lambda data: extract_profile(data, client=self.client)  # noqa: E731
+        profile = self._cache.get(path, read)
+        # One re-read when the image disagrees with the filename about which
+        # entity this is. See LocalDecisionSource.load: vision transposes a
+        # digit occasionally, and a cached bad read would look permanent.
+        if not _same_embs(profile.embs, embs):
+            profile = self._cache.refresh(path, read)
+        return profile
 
 
 class PortalImageSource:
@@ -535,8 +541,10 @@ TOOL_SPEC = {
             "Го враќа основниот профил на конкретен регистриран субјект од "
             "Централниот регистар по ЕМБС: ЕДБ, скратен назив, датум на "
             "основање, правна форма, правен статус, адреса, претежна дејност и "
-            "големина. Користи го САМО кога корисникот бара податоци за ОДРЕДЕН "
-            "субјект и го дал неговиот ЕМБС. НЕ го користи за општи прашања за "
+            "големина. Користи го кога корисникот бара податоци за ОДРЕДЕН "
+            "субјект и го дал неговиот ЕМБС. Ако дал само НАЗИВ, прво повикај "
+            "search_entity_profile за да го добиеш ЕМБС, па потоа овој алат; "
+            "НЕ измислувај ЕМБС. НЕ го користи за општи прашања за "
             "постапки, документи, рокови или тарифи -- тие се одговараат од "
             "документацијата. Ако е потребна САМО големината, користи "
             "check_entity_size, кој е побрз и поевтин. Ако одговорот има "

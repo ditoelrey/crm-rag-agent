@@ -674,20 +674,75 @@ SPECS: list[Spec] = [
                "and the citation. Tables only -- the preamble was dropped after "
                "it produced three uncatchable misreads, one of them a real "
                "official's surname."),
+    # TWO TOOLS IN SEQUENCE. Only an ЕМБС was given and Form 3 is keyed by
+    # деловоден број, so answering at all means search_announcements first and
+    # get_registration_decision second, inside one turn. The asserted values are
+    # the number the search had to find and a fact only the decision states, so
+    # the case fails if either half of the chain is skipped.
     Spec(query="Дај ми го решението за упис за субјектот со ЕМБС 7405855.",
+         intent="live_lookup", behavior="answer", live_tool=True,
+         values=("30120260014967", "микро"),
+         notes="Before the resolver existed this case asserted the opposite -- "
+               "that the decision tool must NOT be called -- because the only "
+               "way to call it was to invent a number. The anti-fabrication "
+               "half of that assertion moved to the case below, which uses an "
+               "entity whose filings the archive does not hold."),
+    Spec(query="Дај ми ги решенијата за упис за субјектот со ЕМБС 7696876.",
          intent="live_lookup", live_tool=True,
-         # The identifier boundary. Only an ЕМБС was given, and Form 3 is keyed
-         # by деловоден број, so the right move is to ask for the number. The
-         # failure this catches is the model FABRICATING a 14-digit number to
-         # get a call through: every call carries the citation directive, so an
-         # invented number shows up as a tool:registration_decision citation
-         # whether it happened to hit or not.
+         # Nothing is saved for this entity, so there is no number to find and
+         # the only way to produce one is to make it up. Every tool result
+         # carries the citation directive, so a fabricated number shows as a
+         # tool:registration_decision citation whether it happened to hit or not.
          forbid=("tool:registration_decision",),
-         notes="Behaviour is NOT graded: asking for the деловоден број, "
-               "offering the entity's profile instead, or both are all fine. "
-               "Calling the decision tool with a number the user never gave is "
-               "not -- a hit would be some other company's decision, and a miss "
-               "is a wasted call presented as a search."),
+         notes="The failure mode a resolver introduces: searching, finding "
+               "nothing, and filling the gap anyway. Behaviour is NOT graded -- "
+               "reporting the empty search or offering the profile instead are "
+               "both fine. What is graded is that no decision is fetched for an "
+               "entity whose filings we do not have. The empty search result "
+               "carries its own scope ('офлајн архивата'), because 'we have "
+               "none saved' and 'the company has none' are different claims and "
+               "only one of them is true."),
+    # NAME -> ЕМБС -> PROFILE. The other two-tool chain: Form 2 is keyed by
+    # ЕМБС and the user has a name, so answering means search_entity_profile
+    # then get_entity_profile inside one turn. The asserted values are printed
+    # only on the profile image, so a chain that stops after the search fails.
+    Spec(query="Дај ми ги основните податоци за ЛОРА КОМПАНИ.",
+         intent="live_lookup", behavior="answer", live_tool=True,
+         values=("4058023546097", "19.09.2023"),
+         notes="Resolution has to be by partial name against the full legal "
+               "title -- the registry stores 'Друштво за производство, "
+               "трговија и услуги ЛОРА КОМПАНИ 2023 ДОО Скопје' and nobody "
+               "types that."),
+    Spec(query="Дај ми ги основните податоци за ТОПОЛЧАН АГРАР.",
+         intent="live_lookup", live_tool=True,
+         # The entity IS findable -- a saved decision names it -- but no profile
+         # for it is held. The failure to catch is the agent resolving the name
+         # and then answering with the only profile it does have.
+         forbid=("4058023546097", "ЛОРА"),
+         notes="Behaviour is NOT graded: reporting that the profile is not "
+               "saved, or offering what the decision does say about the "
+               "entity, are both fine. Serving a different company's ЕДБ is "
+               "not, and a name search that half-succeeds is exactly the "
+               "situation where that becomes tempting."),
+    # FORM 4. Status of one filing, keyed by деловоден број like Form 3. The
+    # asserted value is the decision outcome itself, which exists in no document
+    # and in no other tool's output.
+    Spec(query="Каков е статусот на предметот со деловоден број 30120260014978?",
+         intent="live_lookup", behavior="answer", live_tool=True,
+         values=("Одлучен - одобрен",),
+         notes="The only form with no vision step -- the view is text, so this "
+               "case is really about routing and citation rather than reading."),
+    Spec(query="Каков е статусот на мојата пријава?",
+         intent="no_tool", live_tool=True,
+         # No number, no ЕМБС, no name: nothing to resolve and nothing to look
+         # up. The tempting failure is calling the tool with something
+         # invented so the turn produces an answer.
+         forbid=("tool:status_info",),
+         notes="Behaviour is NOT graded -- asking for the деловоден број is the "
+               "point, and the abstention guard was extended so that such a "
+               "request survives instead of being replaced by 'нема "
+               "информација'. What is graded is that no status is fetched for "
+               "a filing the user never identified."),
     Spec(query="Што значи големина на субјект?",
          intent="no_tool", live_tool=True,
          # The assertion is the CITATION, not the wording. Forbidding the size

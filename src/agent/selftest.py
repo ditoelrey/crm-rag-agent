@@ -901,6 +901,335 @@ def _decision_tool_tests(c) -> None:
           a.text, HARD_ABSTENTION)
 
 
+def _search_tool_tests(c) -> None:
+    """Resolving an entity to the деловоден број Form 3 needs."""
+    print("[announcement search]")
+    from pydantic import ValidationError
+
+    from .tools.announcement_search import (DOC_TYPE_CODES, LocalDecisionIndex,
+                                            SearchArgs, build_payload,
+                                            date_ticks, search_announcements)
+    from .tools.fixtures import _FixtureDecisionSource, _FixtureIndex
+    from .tools.matching import as_date
+    from .tools.registration_decision import fetch_decision
+
+    _as_date = as_date
+
+    def find(**criteria):
+        base = {"embs": "", "name": "", "doc_type": "", "date": ""}
+        return search_announcements(**{**base, **criteria}, index=_FixtureIndex())
+
+    # ARGUMENTS. A search with no criteria would return the whole archive and
+    # read as "these are the entity's filings".
+    try:
+        find()
+        check_true("a search with no criteria is refused", False)
+    except ValidationError:
+        check_true("a search with no criteria is refused", True)
+    for bad, why in (({"embs": "740585"}, "a 6-digit ЕМБС"),
+                     ({"date": "2026-09-17"}, "an ISO date")):
+        try:
+            find(**bad)
+            check_true(f"{why} is refused", False)
+        except ValidationError:
+            check_true(f"{why} is refused", True)
+
+    # DATES. The decision prints "17 септ. 2026"; the user types "17.09.2026".
+    check("an abbreviated Macedonian month normalises", _as_date("17 септ. 2026"),
+          "17.09.2026")
+    check("...as does the full month name", _as_date("1 септември 2026"),
+          "01.09.2026")
+    check("...and a numeric date", _as_date("7.9.2026"), "07.09.2026")
+    check("a non-date is not a date", _as_date("По службена должност"), None)
+
+    # RESOLUTION, which is the whole point: entity in, filing number out.
+    for label, criteria in (("ЕМБС", {"embs": "7405855"}),
+                            ("zero-padded ЕМБС", {"embs": "07405855"}),
+                            ("name", {"name": "тополчан"}),
+                            ("date", {"date": "17.09.2026"}),
+                            ("name and date", {"name": "ТОПОЛЧАН",
+                                               "date": "17.09.2026"})):
+        hits = [h.deloveden_broj for h in find(**criteria).hits]
+        check(f"resolves by {label}", hits, ["30120260014967"])
+
+    # AND, not OR. Returning everything named ТОПОЛЧАН for a search that also
+    # named a date is a wrong answer in the shape of a right one.
+    check("every criterion must hold",
+          find(name="ТОПОЛЧАН", date="01.01.2020").hits, [])
+    check("...including the kind of decision",
+          find(embs="7405855", doc_type="ликвидација").hits, [])
+
+    # THE LIVE PAYLOAD. Not called, but reproduced exactly from the capture --
+    # including the date, which the portal sends as local midnight in Skopje
+    # expressed in UTC ticks. A naive conversion is two hours out in September
+    # and would silently ask about the previous day.
+    check("the captured request is reproduced", build_payload(SearchArgs(
+        embs="7696876", name="", doc_type="", date="10.09.2026")),
+        {"LEID": 7696876, "partOfName": None, "docTypeID": None,
+         "announcementDateTicks": 639245880000000000, "ut": False})
+    # How far the sent value sits from treating local midnight AS UTC: two
+    # hours in summer, one in winter. A fixed offset would be wrong for five
+    # months of the year, and wrong by a whole day at the boundary.
+    from datetime import datetime as _dt
+    HOUR = 36_000_000_000
+
+    def naive(d):
+        return int((_dt.strptime(d, "%d.%m.%Y")
+                    - _dt(1, 1, 1)).total_seconds()) * 10_000_000
+    check("a September date is sent as UTC+2",
+          naive("10.09.2026") - date_ticks("10.09.2026"), 2 * HOUR)
+    check("a January date is sent as UTC+1",
+          naive("15.01.2026") - date_ticks("15.01.2026"), HOUR)
+    check("a Macedonian entry type maps to the form's code",
+          build_payload(SearchArgs(embs="", name="x", doc_type="ликвидација",
+                                   date=""))["docTypeID"], 201)
+    check_true("an unknown entry type is sent as null, not guessed",
+               build_payload(SearchArgs(embs="", name="x",
+                                        doc_type="нешто друго",
+                                        date=""))["docTypeID"] is None)
+    check_true("the code table is marked incomplete in the source",
+               len(DOC_TYPE_CODES) == 5)
+
+    # NOTHING FOUND is a result, and must not overstate itself: we searched our
+    # archive, not the registry.
+    empty = find(embs="7696876")
+    check("an entity with nothing saved finds nothing", empty.found, False)
+    text = empty.as_context_doc().block.content
+    check_true("...and the reply says the search was of the offline archive",
+               "офлајн архивата" in text)
+    check_true("...and points at the portal", "порталот" in text)
+    check_true("...and never claims the entity HAS no decisions",
+               "нема решенија" not in text and "нема објави" not in text)
+    check_true("an empty search is still citable",
+               empty.as_context_doc().chunk_id.startswith("tool:announcement_search:"))
+
+    # THE INVARIANT: anything found can then be fetched. A resolver that hands
+    # back a number Form 3 cannot open has only moved the failure one step.
+    for hit in find(embs="7405855").hits:
+        got = fetch_decision(hit.deloveden_broj, source=_FixtureDecisionSource())
+        check_true(f"{hit.deloveden_broj} is fetchable", getattr(got, "available", False))
+
+    # The live index reads its numbers from filenames -- no vision call to list.
+    # Asserted as membership, not equality: the operator adds saved documents
+    # to assets/ as they go, and a gate that fails when they do teaches people
+    # to ignore it.
+    numbers = LocalDecisionIndex().numbers()
+    check_true("the offline index sees the saved decisions",
+               "30120260014967" in numbers, str(numbers))
+
+    # A TRANSIENT MISREAD. Measured on a real founding decision: the same image
+    # at temperature 0 transposed two digits of its 14-digit number in one read
+    # out of four, and the cross-check inside the document did NOT catch it --
+    # the field and the table row were misread identically. The filename is the
+    # independent claim that does catch it, so a disagreement triggers one
+    # re-read; a disagreement that survives means the file cannot be identified.
+    import agent.tools.registration_decision as _rd
+    from .tools.fixtures import RECORDED_DECISIONS as _REC
+
+    real = _rd.extract_decision
+    number = "30120260014967"
+    good = _REC[number]
+    bad = good.model_copy(update={"deloveden_broj": "30120206014967"})
+
+    def flaky(reads):
+        """Returns each read in turn, then repeats the last one. The index
+        walks every saved decision, so a fixed-length script runs out."""
+        pending = list(reads)
+
+        def fake(image_bytes, **kw):
+            return pending.pop(0) if len(pending) > 1 else pending[0]
+        return fake
+
+    index = LocalDecisionIndex()
+    try:
+        _rd.extract_decision = flaky([bad, good])
+        got = _rd.LocalDecisionSource().load(number)
+        check("a misread number is re-read, and the good read wins",
+              got.deloveden_broj, number)
+
+        _rd.extract_decision = flaky([bad, bad])
+        index.source = _rd.LocalDecisionSource()
+        listed = [d.deloveden_broj for d in index.all_decisions()
+                  if d.deloveden_broj == number]
+        check("a file that stays unidentifiable is not offered by search",
+              listed, [])
+        check_true("...and is reported, not silently dropped",
+                   number in index.rejected, str(index.rejected))
+    finally:
+        _rd.extract_decision = real
+
+    check_true("the tool warns against inventing a number",
+               "НЕ измислувај" in
+               __import__("agent.tools.announcement_search", fromlist=["x"])
+               .TOOL_SPEC["function"]["description"])
+
+
+def _entity_search_tests(c) -> None:
+    """Resolving a company NAME to the ЕМБС Form 2 needs."""
+    print("[entity search]")
+    from pydantic import ValidationError
+
+    from .tools.entity_profile import fetch_profile
+    from .tools.entity_search import (LocalEntityIndex, search_entity_profile)
+    from .tools.fixtures import _FixtureEntityIndex, _FixtureSource
+
+    def find(**criteria):
+        base = {"name": "", "embs": ""}
+        return search_entity_profile(**{**base, **criteria},
+                                     index=_FixtureEntityIndex())
+
+    try:
+        find()
+        check_true("a search with neither name nor ЕМБС is refused", False)
+    except ValidationError:
+        check_true("a search with neither name nor ЕМБС is refused", True)
+
+    # RESOLUTION. Partial, case-insensitive, and across the whole legal name --
+    # users type the trading name, the registry stores the full one.
+    for label, name in (("the full trading name", "ЛОРА КОМПАНИ"),
+                        ("lowercase", "лора компани"),
+                        ("one word", "ЛОРА"),
+                        ("a name buried in the legal form", "КОМПАНИ 2023")):
+        check(f"resolves {label}", [h.embs for h in find(name=name).hits],
+              ["7696876"])
+
+    # An entity known only from a DECISION. It has no saved profile, so the
+    # search must find it and say so -- the alternative is the agent resolving
+    # a name, fetching, and hitting "not available" a round later.
+    topolchan = find(name="ТОПОЛЧАН АГРАР")
+    check("a decision names an entity no profile covers",
+          [h.embs for h in topolchan.hits], ["7405855"])
+    check("...flagged as having no saved profile",
+          [h.has_profile for h in topolchan.hits], [False])
+    check("...and attributed to the decision",
+          [h.seen_in for h in topolchan.hits], [["решение"]])
+    check_true("...which the citable text states",
+               "не е зачуван" in topolchan.as_context_doc().block.content)
+    # And the flag is true: fetching it really does come back unavailable.
+    got = fetch_profile("7405855", source=_FixtureSource())
+    check("...matching what a fetch would return", got.available, False)
+
+    check("a profile-backed entity is flagged as available",
+          [h.has_profile for h in find(name="ЛОРА").hits], [True])
+
+    # NOTHING FOUND, with the same scope discipline as announcement_search.
+    missing = find(name="НЕПОСТОЕЧКА ФИРМА")
+    check("an unknown name finds nothing", missing.found, False)
+    text = missing.as_context_doc().block.content
+    check_true("...and says the archive was searched, not the registry",
+               "офлајн архивата" in text and "порталот" in text)
+    check_true("...and never claims the entity does not exist",
+               "не постои" not in text.replace("може да постои", ""))
+    check_true("an empty entity search is still citable",
+               missing.as_context_doc().chunk_id.startswith("tool:entity_search:"))
+
+    # THE INVARIANT, as for announcements: what is found can then be fetched.
+    for hit in find(name="ЛОРА").hits:
+        got = fetch_profile(hit.embs, source=_FixtureSource())
+        check_true(f"{hit.embs} is fetchable", got.available)
+
+    # The live index lists ЕМБС values from filenames, with no vision call.
+    numbers = LocalEntityIndex().profile_numbers()
+    check_true("the offline index sees the saved profiles",
+               "7696876" in numbers and len(numbers) >= 3, f"{numbers}")
+
+
+def _status_tool_tests(c) -> None:
+    """Form 4: Статус на предмет. Text in, no vision anywhere."""
+    print("[status info]")
+    from pydantic import ValidationError
+
+    from .tools.fixtures import RECORDED_STATUS, _FixtureStatusSource
+    from .tools.status_info import (TOOL_SPEC, LocalStatusSource, StatusArgs,
+                                    StatusResult, StatusUnavailable,
+                                    fetch_status, parse_infobox, parse_status)
+
+    number = "30120260014978"
+
+    check("a 14-digit деловоден број is accepted",
+          StatusArgs(document_id=f" {number} ").document_id, number)
+    for wrong, why in (("7405855", "an ЕМБС"), ("3012026001497", "13 digits")):
+        try:
+            StatusArgs(document_id=wrong)
+            check_true(f"{why} is refused", False)
+        except ValidationError:
+            check_true(f"{why} is refused", True)
+
+    # THE PARSER, against the structure the portal renders. Labels are matched,
+    # not positions, so an extra row or a reordering does not shift every field
+    # by one -- which, for a box whose last line is the STATUS, would mean
+    # reporting a date as the outcome of someone's application.
+    html = ('<div class="infobox"><h2>ТЕСТ ДОО Скопје</h2>'
+            '<h3>Предметни податоци:</h3>'
+            '<p>Датум на објава: <b>18.9.2026 18:45</b></p>'
+            '<p>Опис на документ: <b>Упис на основање</b></p>'
+            '<p>Статус: <b>Одлучен - одобрен</b></p></div>')
+    parsed = parse_infobox(html)
+    check("the entity name comes off the heading", parsed.entity_title,
+          "ТЕСТ ДОО Скопје")
+    check("the publication date is read", parsed.publication_date, "18.9.2026 18:45")
+    check("the document description is read", parsed.document_description,
+          "Упис на основање")
+    check("the status is read", parsed.status, "Одлучен - одобрен")
+
+    reordered = ('<div class="infobox"><h2>ТЕСТ ДОО Скопје</h2>'
+                 '<p>Статус: <b>Одлучен - одобрен</b></p>'
+                 '<p>Нешто ново: <b>вредност</b></p>'
+                 '<p>Датум на објава: <b>18.9.2026 18:45</b></p></div>')
+    shuffled = parse_infobox(reordered)
+    check("a reordered box with an unknown row still reads correctly",
+          (shuffled.status, shuffled.publication_date),
+          ("Одлучен - одобрен", "18.9.2026 18:45"))
+    check("...and the absent field is empty, not shifted",
+          shuffled.document_description, "")
+
+    # The saved file may be the API's JSON instead of the page.
+    api = parse_status('{"title": "ТЕСТ ДОО", "publishDate": "18.9.2026 18:45",'
+                       ' "documentDescription": "Упис на основање",'
+                       ' "status": "Одлучен - одобрен"}')
+    check("the portal's own JSON field names are accepted",
+          (api.entity_title, api.status), ("ТЕСТ ДОО", "Одлучен - одобрен"))
+
+    # RESULTS.
+    got = fetch_status(number, source=_FixtureStatusSource())
+    check_true("a held filing returns its status", isinstance(got, StatusResult))
+    doc = got.as_context_doc()
+    check("the status is citable", doc.chunk_id, f"tool:status_info:{number}")
+    for value in (number, "Одлучен - одобрен", "Упис на основање", "18.9.2026 18:45",
+                  "БЕКАТОН ЕЛИТ ТП Пробиштип"):
+        check_true(f"{value!r} survives into the citable text",
+                   value in doc.block.content)
+    untitled = StatusResult(
+        document_id=number, fetched_at="x",
+        info=RECORDED_STATUS[number].model_copy(update={"entity_title": ""}))
+    check_true("an empty field prints no bare label",
+               "Субјект:" not in untitled.as_context_doc().block.content)
+
+    miss = fetch_status("30120260014967", source=_FixtureStatusSource())
+    check_true("an unheld filing returns a value, not an exception",
+               isinstance(miss, StatusUnavailable))
+    check("...flagged unavailable", miss.available, False)
+    check("...and citable", miss.as_context_doc().chunk_id,
+          "tool:status_info:30120260014967:unavailable")
+    check_true("...in wording the abstention guard recognises",
+               "не е достапен" in miss.as_context_doc().block.content)
+
+    # PRODUCTION vs GATES. The eval replays RECORDED_STATUS; the CLI reads
+    # assets/. They diverged once -- the eval scored this filing 1.000 while the
+    # CLI reported it unavailable, because no asset had been saved -- and the
+    # eval could not notice, since it never touches the production source.
+    # Where a filing exists in both, they must say the same thing.
+    saved = LocalStatusSource().load(number)
+    check_true("the production source serves the recorded filing", saved is not None)
+    check("...with exactly the recorded fields", saved, RECORDED_STATUS[number])
+
+    description = TOOL_SPEC["function"]["description"]
+    check_true("the tool routes an ЕМБС through the search first",
+               "search_announcements" in description)
+    check_true("...and forbids inventing a number",
+               "НИКОГАШ не измислувај" in description)
+
+
 def _orchestration_tests(c) -> None:
     print("[orchestration]")
     tariffs = [b.chunk_id for b in c.by_service[2135] if b.type == "tariffs"][:5]
@@ -1162,7 +1491,9 @@ def main() -> int:
     for stage in (_dedup_tests, _ambiguity_tests, _structure_ambiguity_tests,
                   _structured_fetch_tests, _citation_tests, _clarification_tests,
                   _injection_tests, _tool_tests, _profile_tool_tests,
-                  _decision_tool_tests, _orchestration_tests):
+                  _decision_tool_tests, _search_tool_tests,
+                  _entity_search_tests, _status_tool_tests,
+                  _orchestration_tests):
         try:
             stage(c)
         except Exception:

@@ -21,25 +21,37 @@ the day an official feed arrives, default_source() changes and nothing else does
 Form 3 (Објави на уписи -- a published Решение) runs offline for the same reason
 and in the same way, but is keyed by the 14-digit деловоден број rather than the
 ЕМБС: one entity accumulates many decisions, and the endpoint addresses a filing.
+search_announcements resolves an entity to those numbers, so the pair is used in
+sequence -- search, then fetch -- which is what MAX_TOOL_ROUNDS already allows.
 
-Form 4 (Статус на обработка) is deliberately absent: it sits behind reCAPTCHA,
-and working around bot protection is not on the table. If the registry provides
-an API for it, or the user completes the challenge themselves, it can be added
-here like any other.
+Form 4 (Статус на предмет) is here now, offline like the rest. Its statusInfo
+endpoint looked unprotected in the capture; asked directly, it answers
+412 "Recaptcha token missing", so the live GET stays dormant and the tool reads
+statuses an operator saved. It is the one form with no vision step: the view is
+text, so what the agent reports is the saved bytes rather than a read of a
+picture.
 """
 from __future__ import annotations
 
-from . import entity_profile, entity_size, registration_decision
+from . import (announcement_search, entity_profile, entity_search, entity_size,
+               registration_decision, status_info)
 
 REGISTRY = [entity_size.TOOL_SPEC, entity_profile.TOOL_SPEC,
-            registration_decision.TOOL_SPEC]
+            registration_decision.TOOL_SPEC, announcement_search.TOOL_SPEC,
+            entity_search.TOOL_SPEC, status_info.TOOL_SPEC]
 
 DISPATCH = {
     "check_entity_size": lambda **kw: entity_size.fetch_entity_size(**kw),
     "get_entity_profile": lambda **kw: entity_profile.fetch_profile(**kw),
     "get_registration_decision":
         lambda **kw: registration_decision.fetch_decision(**kw),
+    "search_announcements":
+        lambda **kw: announcement_search.search_announcements(**kw),
+    "search_entity_profile":
+        lambda **kw: entity_search.search_entity_profile(**kw),
+    "get_status_info": lambda **kw: status_info.fetch_status(**kw),
 }
 
-__all__ = ["REGISTRY", "DISPATCH", "entity_profile", "entity_size",
-           "registration_decision"]
+__all__ = ["REGISTRY", "DISPATCH", "announcement_search", "entity_profile",
+           "entity_search", "entity_size", "registration_decision",
+           "status_info"]

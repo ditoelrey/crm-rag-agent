@@ -97,3 +97,19 @@ class ImageCache:
         if key not in self._store:
             self._store[key] = extract(read_png(path))
         return self._store[key]  # type: ignore[return-value]
+
+    def refresh(self, path: Path, extract: Callable[[bytes], T]) -> T:
+        """Read again, ignoring and replacing any cached result.
+
+        For the one case that justifies paying twice: the cached read disagrees
+        with the identity the caller asked for. Measured on a real decision --
+        same file, same prompt, temperature 0 -- gpt-4o transposed two digits of
+        a 14-digit number in one read out of four, and three re-reads were
+        correct. Caching that one bad read would make a good document look
+        permanently broken.
+        """
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        value = extract(read_png(path))
+        self._store[key] = value
+        return value
