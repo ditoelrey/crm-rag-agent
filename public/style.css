@@ -1,0 +1,48 @@
+@charset "UTF-8";
+
+/* ===========================================================================
+   Welcome screen.
+
+   chainlit.md is NOT the welcome screen in Chainlit 2.x -- it is the page
+   behind the "Readme" button in the header. The empty-thread screen renders a
+   logo and the starters, and the only hook into it is CSS. Hence the slogan
+   lives here, as generated content on .welcome-screen, rather than in markdown
+   or in an on_chat_start message (which would hide the starters entirely,
+   since Chainlit shows them only while the thread has no messages).
+
+   Selectors verified against the running DOM, not guessed:
+     .welcome-screen            stable class on the empty-thread container
+     img.logo                   the Chainlit wordmark
+     button[id^="starter-"]     each starter; the id prefix is generated
+   =========================================================================== */
+
+/* Chainlit's own wordmark, replaced by the slogan. To use your own logo
+   instead, drop public/logo_light.png and public/logo_dark.png in place and
+   delete this rule. */
+.welcome-screen img.logo {
+  display: none;
+}
+
+.welcome-screen::before {
+  content: "Вашиот водич низ Централниот регистар.\A Од каде да почнеме?";
+  white-space: pre-line;          /* \A becomes the line break */
+  text-align: center;
+  font-size: 1.75rem;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  margin-bottom: 0.75rem;
+}
+
+/* Starters: one per row, flush with the composer's left edge.
+   width:100% is load-bearing. The container has no width class, so as a flex
+   item of a column parent with items-center it shrinks to its content and gets
+   re-centred -- measured at x=254 against the composer's x=144. Stretching it
+   puts all three at 144. */
+.welcome-screen > div:has(> button[id^="starter-"]) {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  width: 100%;
+  align-self: stretch;
+}
