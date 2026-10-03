@@ -1,61 +1,36 @@
-# ЦРМ Агент — Retrieval-Augmented Assistant for the Central Registry of North Macedonia
+# ЦРМ Агент
 
-A production-grade RAG system over the e-services documentation of the **Central
-Registry of the Republic of North Macedonia** (Централен регистар на РСМ).
+**A grounded AI agent for the Central Registry of North Macedonia** — answers
+questions about company registration, annual accounts, pledges, certificates,
+fees and deadlines in Macedonian, with a citation on every factual claim, and
+executes live lookups against the registry's own services.
 
-It answers citizens' questions about registering a company, filing an annual
-account, registering a pledge, obtaining certificates, fees, deadlines and
-required documents — in Macedonian, with a citation on every factual claim.
+Hybrid retrieval over 7,759 corpus blocks, native OpenAI tool calling with six
+tools, a deterministic evaluation harness, and a web UI that shows every step
+the agent takes. No LangChain, no agent framework — the orchestration is ~150
+lines of plain Python.
 
-The hard part of this domain is not retrieval volume. It is that **the same
-service has different correct answers depending on a variable the user rarely
-states**: registering an АД is free, registering a Фондација costs 2,452 МКД,
-and the required-documents list differs across all nine legal forms. A system
-that answers confidently without resolving that variable is not helpful — it is
-wrong in a way the reader cannot detect.
-
-Everything below exists to make that failure mode measurable and then rare.
+> The hard part of this domain is not retrieval volume. The *same* service has
+> different correct answers depending on a variable the user rarely states:
+> registering an АД is free, a Фондација costs 2,452 МКД, and the required
+> documents differ across all nine legal forms. An answer that skips that
+> variable is wrong in a way the reader cannot detect. Everything here exists to
+> make that failure measurable, then rare.
 
 ---
 
 ## Table of Contents
 
-- [Design principles](#design-principles)
 - [Architecture](#architecture)
 - [Core features](#core-features)
+- [Live tools](#live-tools)
+- [Web UI](#web-ui)
 - [Measured results](#measured-results)
 - [Quick start](#quick-start)
 - [Repository layout](#repository-layout)
 - [Evaluation harness](#evaluation-harness)
-- [Roadmap](#roadmap)
 - [Tech stack](#tech-stack)
 - [Known limitations](#known-limitations)
-
----
-
-## Design principles
-
-**1. An unanswerable question must fail loudly, not quietly.**
-Stale gold, a fabricated citation, a corpus block that no longer parses — each
-aborts a build or raises a warning rather than silently scoring zero. A retrieval
-miss and a broken index must never look the same.
-
-**2. Grounded is not the same as complete.**
-The most dangerous output this system produced during development was not a
-hallucination. It was a fully-cited, four-step procedure for registering a pledge
-— when the registry defines **six** steps. The three missing ones covered
-processing, approval, and what happens if the application is *refused*. Every
-sentence was true and sourced. The answer was still wrong, and no reader could
-have known. Several components exist purely to close that class of failure.
-
-**3. Refusing to answer is a feature.**
-When the corpus does not cover something, the agent says so. When the answer
-depends on a legal form the user has not named, it asks instead of guessing.
-
-**4. Nothing ships unmeasured.**
-Every retrieval change is an A/B against a frozen gold set with a per-family
-regression gate. Two designs in this repository were measured, found to be net
-losses, and rewritten — the reasoning is preserved in the code comments.
 
 ---
 
@@ -63,11 +38,13 @@ losses, and rewritten — the reasoning is preserved in the code comments.
 
 ```mermaid
 flowchart TB
-    Q["User question<br/><i>Колку чини регистрација?</i>"] --> PLAN
+    UI["Web UI<br/><small>Chainlit on FastAPI · live step tracing</small>"] --> Q
+    CLI["CLI<br/><small>agent.cli</small>"] --> Q
+    Q["User question"] --> PLAN
 
     subgraph PLAN ["Query planning"]
         direction TB
-        FU["Follow-up resolution<br/><small>merge with topic, derive variant filter</small>"]
+        FU["Follow-up resolution<br/><small>merge topic, derive variant filter</small>"]
         AL["Alias expansion<br/><small>регистрација → упис, основање</small>"]
         FU --> AL
     end
@@ -86,306 +63,221 @@ flowchart TB
 
     subgraph CTX ["Context assembly"]
         direction TB
-        DD["Content dedup<br/><small>+ provenance</small>"]
+        DD["Dedup + provenance"]
         CV["Coverage audit<br/><small>COMPLETE vs PARTIAL</small>"]
         AM["Ambiguity detection<br/><small>evidence + structure</small>"]
         DD --> CV --> AM
     end
 
-    CTX --> LLM["OpenAI · gpt-4o-mini · temp 0.0<br/><small>XML documents in a separate system message</small>"]
+    CTX --> LLM["gpt-4o · temp 0.0<br/><small>native tool calling, ≤3 rounds</small>"]
+    LLM <--> TOOLS
+
+    subgraph TOOLS ["Live tools — REGISTRY / DISPATCH"]
+        direction LR
+        T1["size · profile<br/>decision · status"]
+        T2["resolvers<br/><small>name → ЕМБС → filing no.</small>"]
+    end
+
     LLM --> VER["Citation verification<br/><small>valid / stale / fabricated</small>"]
     VER --> A["Answer · Clarify · Abstain"]
 ```
 
-Each stage is a thin wrapper implementing one interface — `search(query, k)` —
-so any layer can be switched off and scored against the same gold set.
+Every layer implements one interface — `search(query, k, filters)` — so any of
+them can be switched off and scored against the same gold set.
 
 ---
 
 ## Core features
 
-### Hybrid retrieval with Reciprocal Rank Fusion
-
-BM25 over a Macedonian stemmer, fused with dense cosine search over Qdrant.
-
-RRF rather than score blending, because the two scores are not comparable:
-BM25 returns unbounded term-weight sums, Qdrant returns cosine similarity. Ranks
-are comparable; scores are not.
+**Hybrid retrieval with Reciprocal Rank Fusion.** BM25 over a Macedonian stemmer
+fused with dense cosine search. RRF rather than score blending, because the two
+scores are not comparable — ranks are:
 
 ```
 score(d) = w_lex / (K + rank_lex(d)) + w_vec / (K + rank_vec(d))      K = 60
 ```
 
-Each arm is queried to depth 50, so a document ranked ~30 by one arm can still be
-rescued by the other. The same fusion primitive is reused at every join in the
-pipeline — alias expansion, structured fetch — which keeps failure containment
-uniform: a wrong signal costs ranking slots, never the whole answer.
+Each arm runs to depth 50, so a document ranked ~30 by one arm is still
+rescuable by the other. The stemmer is load-bearing: Macedonian suffixes its
+definite articles (`куќа → куќата → куќите`), and disabling it regresses six
+retrieval families.
 
-The Macedonian stemmer is load-bearing, not decoration: disabling it regresses
-six retrieval families. Definite articles are suffixed in Macedonian
-(`куќа → куќата → куќите`), so an unstemmed index loses substantial recall.
+**Semantic alias layer.** Citizens and the registry use different words — users
+say `машина` (0 corpus hits) where the registry says `подвижни предмети` (430),
+`гасење` (0) for `бришење` (1,081). Abbreviations are parsed from the registry's
+own glossary blocks and stay current on rebuild; the rest are curated and
+justified by counting both words. Expansion **fuses** rather than replaces:
+replacement was measured, lifted the family it targeted, regressed seven others,
+and was rejected.
 
-### Semantic alias layer
+**Disambiguation that fires before the model sees anything.** Two deterministic
+detectors — one evidence-based, one reading the corpus schema for sibling
+variants whose section *differs even when retrieval surfaced none of them*. The
+second is the one that matters: on a bare *"Колку чини регистрација?"* retrieval
+returns zero tariff rows, because the word matches blocks about registering a
+user account. Four guards keep it from over-firing, each tested in both
+directions.
 
-Citizens and the registry do not use the same words. Measured over the corpus:
-
-| user says | occurrences | registry says | occurrences |
-|---|---:|---|---:|
-| машина | **0** | подвижни предмети | 430 |
-| гасење | **0** | бришење | 1,081 |
-| фирма | 192 | субјект | 1,680 |
-| регистрација | 360 | упис | 2,235 |
-| цена | 153 | тарифа | 490 |
-
-Two sources, deliberately different in kind:
-
-- **Derived** — the registry defines its own abbreviations in glossary blocks
-  (`Термин: Акционерско друштво (АД)`). Fifteen of them (АД, ДОО, ПДОО, ТП, ЈТД,
-  КД, КДА, СИЗ…) are parsed out automatically and stay current on rebuild.
-- **Curated** — the gaps above, each justified by counting *both* words. An alias
-  is only worth adding if the target is what the text actually says.
-
-Expansion **fuses** rather than replaces. Replacing was implemented, measured,
-and rejected: it lifted the underspecified questions it was built for but
-regressed seven other families, because a query that already names its service
-gets diluted by synonyms. Fusing keeps what the original got right and lets the
-expansion contribute only what it missed.
-
-Glossary abbreviations are used for matching and displaying legal forms but
-never for query expansion — expanding them injected *"Трговец – поединец"* into
-queries containing the variant label *"Подружница на странско друштво и странски
-ТП"*.
-
-### Smart disambiguation
-
-Two independent detectors, both deterministic — never left to the model noticing:
-
-- **Evidence-based** — two or more variants of one service appear in the
-  retrieved documents contributing the same section type.
-- **Structure-based** — the corpus schema says the attributed service has
-  sibling variants whose relevant section *differs*, **even if retrieval
-  surfaced none of them**.
-
-The second one is what matters. On a bare *"Колку чини регистрација?"* retrieval
-returned **zero tariff rows** — the word "регистрација" matches blocks about
-registering a *user account in the e-system*, while the fee rows say "упис на
-основање". An evidence-only detector stays silent exactly when the user most
-needs to be asked, on a question where two forms are free and seven cost 2,452 МКД.
-
-Four guards keep it from over-firing, each tested in both directions:
-
-| guard | rationale |
-|---|---|
-| service attributed only from variant-scoped blocks | shared terminology is boilerplate replicated across services and identifies a topic, not a service |
-| a variant requires **two** agreeing hits | one hit is precisely the sibling confusion this corpus punishes |
-| the section must genuinely differ across variants | all five variants of *Поднесување годишна сметка* share one identical access block — nothing to choose, so nothing to ask |
-| the question must have a readable intent | an email question once triggered a request to choose between АД, Здружение and Фондација |
-
-When the user replies, the clarification closes the loop: the next turn retrieves
-on *original question + reply* and converts the named form into a
-`variation_scope` filter — which also retains the service-level blocks that apply
-to every variant. Matching is alias-aware, so both `АД` and `акционерско
-друштво` resolve, and `ДОО` correctly reaches the variant the registry labels
-`ПДОО`.
-
-### Structured section fetching — the completeness trap
-
-Semantic search cannot rank `Број на чекор: 4 | ЦРРСМ врши обработка на
-пријавата…` for *"како да регистрирам залог"*. They share no vocabulary, so no
-alias can bridge them. But once the **service** is known — and routing is the
-reliable part of this system, at `service_acc@1 ≈ 1.000` — the rows are a lookup,
-not a search:
-
-```python
-corpus.of_type(2063, "process", 11187)   # all six steps, in order, always
-```
-
-So: resolve `(service, variant)` from what the retriever *did* return, map the
-question to a section type, fetch that section directly, and **fuse** it with the
-semantic results.
-
-Intent cues are ordered most-specific-first, and that order is the precedence.
-Questions routinely trip several at once — *"Каде и како го подигнувам
-документот"* hits `documents`, `process` **and** `access` — and injecting all
-three floods the answer with the wrong sections. Vague interrogatives
-(како / каде / кога) sort last.
-
-Injection is capped at half the requested slots, so a wrong service attribution
-can never take the entire context.
-
-A separate **coverage audit** counts every list-shaped section in the context
-against the corpus and tells the model what it actually holds:
+**Structured section fetching.** Semantic search cannot rank
+`Број на чекор: 4 | ЦРРСМ врши обработка…` for *"како да регистрирам залог"* —
+they share no vocabulary. Once the service is known (routing sits at
+`service_acc@1 ≈ 1.00`) the rows are a lookup, not a search, and get fused in. A
+**coverage audit** then counts list-shaped sections against the corpus and tells
+the model what it actually holds:
 
 ```
-<coverage>
-  process (Упис на залог): 6 of 6 rows -- COMPLETE
-  documents (Упис на залог): 1 of 6 rows -- PARTIAL -- 5 row(s) are not here
-</coverage>
+process (Упис на залог): 6 of 6 rows -- COMPLETE
+documents (Упис на залог): 1 of 6 rows -- PARTIAL -- 5 row(s) are not here
 ```
 
-A section marked PARTIAL may never be presented as a full list. Volunteering
-four of six steps under a heading that implies completeness is a wrong answer
-even when every sentence is true and cited.
+This exists because the most dangerous output this system ever produced was not
+a hallucination: it was a fully-cited four-step procedure for a process the
+registry defines in **six** steps. Every sentence true, every sentence sourced,
+the answer still wrong.
 
-### Deterministic directory lookup
+**Strict citation verification.** Every claim carries a `chunk_id`, checked
+after generation and classified **valid** / **stale** (shown earlier, not
+re-retrieved) / **fabricated**. An answer with no valid citation and no
+abstention marker is replaced outright. The three-way split is not pedantry — a
+validator that cries wolf on correct answers teaches people to ignore it.
 
-The registry publishes authorised-agent lists as spreadsheets: **3,010 agents
-across 60 municipalities**, in two lists with different scopes of authority
-(founding ДОО/ДООЕЛ/ТП, versus founding + changes + deletions by lawyers). They
-are kept separate — merging them would blur a real legal distinction.
+**Deterministic directory lookup.** 3,010 authorised agents across 60
+municipalities, one block per municipality rather than per agent. `СКОПЈЕ`
+expands to all ten city municipalities; oversized buckets split into parts that
+state their own range and true total, so a fragment is visibly a fragment.
+Ingestion is defensive by necessity: the source spreadsheets contained leaked
+formulas and **`АЕРОДРОM` spelled with a Latin `M`**, which would have silently
+split one municipality into two.
 
-One block **per municipality**, not per agent. Three thousand single-agent chunks
-would grow the corpus by 51% with near-identical boilerplate, dilute retrieval
-for every service question, and recreate the completeness trap: *"агенти во
-Прилеп"* would return ten of seventy-five and present them as the list.
+---
 
-Retrieval is a metadata filter, not a search — `fetch_directory` resolves the
-municipality and returns its blocks. Two guards: a municipality alone is not a
-request (a service question can mention one, so an agent cue is also required),
-and `СКОПЈЕ` expands to all ten Skopje municipalities, since 42–50% of agents are
-there and the literal bucket alone would return a third of them.
+## Live tools
 
-Oversized municipalities (Центар has 382 advocates, ~31 KB — past the
-8,191-token embedding limit) split into numbered parts that state their own
-range and true total, so a fragment is visibly a fragment.
+Six tools, registered through a plain `REGISTRY` / `DISPATCH` pattern. The model
+sees only the OpenAI function schemas; raw HTML and images never reach it.
 
-Ingestion is defensive by necessity. The source data contained leaked spreadsheet
-formulas in the municipality column (`ТЕТОВО+A1403:E1404`) and — caught only
-because the validator rejected a duplicate chunk ID — **`АЕРОДРОM` spelled with a
-Latin `M` (U+004D)** instead of Cyrillic `М` (U+041C). Left alone, that homoglyph
-would have split one municipality into two buckets and a lookup would have
-quietly returned half the agents.
-
-### Answer evaluation
-
-Retrieval scoring stops at the context window. A second harness scores what the
-model *says*, reusing the same report format and regression gate:
-
-| metric | catches |
-|---|---|
-| `behavior_match` | answer / clarify / abstain — an agent that always answers scores well everywhere else while being unsafe |
-| `value_recall` | checkable facts (295 МКД, 15 дена, 4 часа), verified against the corpus when the case was written |
-| `no_forbidden` | the near-miss must not appear — 299 МКД is a real tariff for a *different* certificate |
-| `numeric_groundedness` | every multi-digit number in the answer appears in the retrieved context |
-| `value_citation` | a cited block actually *contains* the fact — catches "cited part 1 for a fact in part 2" |
-| `citation_integrity` | no fabricated ids |
-
-Deterministic by default: a fee is right or it is not, and exact matching is
-reproducible where an LLM judge is not (`--judge` adds an opt-in groundedness
-pass for prose claims carrying no number). Generation and scoring are separate
-steps — answers are persisted, so re-scoring after a rule change costs nothing.
-
-Current: **0.994** over 27 curated cases, ~$0.02 per full run. The single
-residual failure is a glossary definition covering two registers where the
-answer states one.
-
-Its first four runs found seven defects — in the gold, the scorers, and the
-retrieval layer — and one in the model. That ratio is the honest state of a new
-instrument: the gold set, not the model, is the binding constraint on what can
-be learned.
-
-### Strict citation verification
-
-Every factual claim carries the exact `chunk_id` in brackets. After generation,
-each is checked against the retrieved set and classified:
-
-| class | meaning | surfaced as |
+| tool | returns | transport |
 |---|---|---|
-| **valid** | in this turn's context | — |
-| **stale** | shown earlier in the session, not re-retrieved | note |
-| **fabricated** | never retrieved at all | hard warning |
+| `check_entity_size` | size class by ЕМБС | **live** WebForms POST, deterministic parse |
+| `get_entity_profile` | 11-field company profile | saved PNG → gpt-4o Vision |
+| `get_registration_decision` | a published Решение, all tables verbatim | saved PNG → gpt-4o Vision |
+| `get_status_info` | filing status | saved JSON/HTML → deterministic parse |
+| `search_entity_profile` | name → ЕМБС | offline index |
+| `search_announcements` | ЕМБС / name / date → filing number | offline index |
 
-The three-way split is not pedantry. The validator initially reported *fabricated*
-for a markdown link and for a citation legitimately carried over from an earlier
-turn — and a validator that cries wolf on correct answers teaches people to
-ignore it.
+The two resolvers exist because the fetch tools are keyed by identifiers users
+don't have. *"Дај ми ги основните податоци за ЛОРА КОМПАНИ"* chains
+`search_entity_profile → get_entity_profile` inside one turn.
 
-Two further guards live in this layer:
+**Every probabilistic read is falsifiable.** A profile or decision image carries
+the identifier it was fetched by; if the extracted identifier doesn't match the
+request, the result is **refused**, not returned with a caveat — wrong-company
+data that looks plausible is the worst outcome available. Vision transposed two
+digits of a 14-digit filing number in one read out of four, so a disagreement
+with the filename triggers one re-read; a disagreement that survives is rejected
+and reported.
 
-- **Zero-fee reporting.** The registry publishes `0.0` for some tariffs. The
-  parser now renders whole denars as integers, and the prompt forbids
-  *"услугата е бесплатна"* — the row is reported as it stands, because telling
-  someone a registration costs nothing is a costly thing to be wrong about.
-- **Conversational memory trimming.** Past answers are truncated to 500
-  characters before entering history. A 36-entry agent list left in history was
-  later welded into a lawyer who does not exist — a Струмица first name, a
-  Гостивар surname and address — citing nothing, because there was nothing to
-  cite. Retrieval re-fetches every turn, so nothing real is lost; only the
-  material to confabulate from.
+**Tool results are citable.** Each becomes a synthetic `ContextDoc` with a
+`tool:` id, so live answers pass the same citation gate as corpus-backed ones.
+
+**On the registry's protections:** the profile, decision and status endpoints sit
+behind reCAPTCHA. This project does not acquire, forge or replay those tokens.
+Those three tools read documents an operator saved from the portal, and report a
+clean "not available offline" for anything else — including an explicit note
+that the search covered the local archive, not the registry. The live transports
+are written and documented, dormant, ready for an official API key.
+
+---
+
+## Web UI
+
+```bash
+python serve.py          # http://127.0.0.1:8000
+```
+
+A Chainlit chat interface mounted as a sub-application on FastAPI. Real-time
+step tracing shows retrieval and each tool call as it happens, with inline
+`[Извор N]` citations that open the exact source block — context line, full
+text, raw `chunk_id`, fetch timestamp for live lookups.
+
+The presentation layer is strictly separate: `app.py` and `ui/` contain all of
+it, and **nothing under `src/` knows the UI exists**. Tracing works by injecting
+wrapped `retriever` and `dispatch` objects through the same constructor
+arguments the eval harness already uses.
+
+> **Use `serve.py`, not `chainlit run`.** Chainlit's CLI calls
+> `nest_asyncio.apply()` at import, which breaks anyio's loop detection on
+> Python 3.14 — every static asset returns HTTP 500 and the page renders blank.
+> Mounting via FastAPI never imports that module.
+
+One backend thread owns the index and runs every turn, because the local Qdrant
+store and the sqlite embedding cache are thread-affine. That makes turns
+serialised by construction rather than by a lock.
 
 ---
 
 ## Measured results
 
-535 evaluation cases (512 synthetic + 23 hand-curated), graded relevance,
-per-family regression gate.
+**Retrieval** — 548 cases (512 synthetic + curated), graded relevance,
+per-family regression gate:
 
-| retriever | hit@1 | hit@5 | mrr@10 | **ndcg@10** |
-|---|---:|---:|---:|---:|
-| BM25 baseline | 0.326 | 0.567 | 0.423 | 0.669 |
-| Dense (OpenAI) | 0.482 | 0.738 | 0.583 | 0.732 |
-| Hybrid (RRF) | 0.467 | 0.696 | 0.565 | 0.751 |
-| + alias layer | 0.470 | 0.694 | 0.565 | 0.747 |
-| **+ structured fetch** | **0.652** | **0.805** | **0.719** | **0.806** |
+| metric | value |
+|---|---:|
+| **ndcg@10** | **0.8135** |
+| hit@10 | 0.8741 |
+| mrr@10 | 0.7466 |
+| `variation_acc@1` | 0.9119 |
+| `sibling_confusion@10` | 0.056 |
 
-> The first three rows were measured on 527 cases, before the underspecified
-> family was added; the last two on 532. Family-level deltas are gated
-> individually, which is what the regression check actually enforces.
+**Answers** — 50 curated cases, **0.988** overall, with
+`no_forbidden`, `numeric_groundedness`, `value_citation` and
+`citation_integrity` all at **1.000**. All 11 tool-routing cases score 1.000.
+A full run costs ~$1.17; a typical answered turn ~$0.02.
 
-On the hand-curated slice — real user phrasing, the only honest quality signal —
-ndcg@10 moved **0.480 → 0.699**.
+**Corpus** — 7,759 blocks: 112 services, 217 variations, plus 146 directory
+blocks covering 3,010 agents. A full index build costs a few cents; the sqlite
+vector cache means only changed blocks are ever re-embedded.
 
-Domain-specific diagnostics on the final stack:
+Three deterministic gates run offline with no API key and no network:
 
-| diagnostic | value | reading |
-|---|---:|---|
-| `service_acc@1` | 0.95 – 1.00 | routing is effectively solved |
-| `variation_acc@1` | 0.78 – 1.00 | correct legal form at rank 1 |
-| `sibling_confusion@5` | 0.00 – 0.08 | wrong-variant contamination is rare |
-| `type_precision@5` | 0.21 → 0.65 | before → after structured fetch (`intent_process`) |
-
-Corpus: **6,069 blocks** — 5,923 service blocks across 112 services and 154
-variants, plus 146 directory blocks covering 3,010 agents.
-Full index build: ~1.35M tokens, roughly **$0.03**. Typical answered turn costs
-**$0.001 – $0.005**.
+```bash
+python -m agent.selftest && python -m eval.cli selftest && python -m agent.injection
+```
 
 ---
 
 ## Quick start
 
 ```bash
-pip install openai qdrant-client openpyxl beautifulsoup4 pydantic
+pip install openai qdrant-client openpyxl beautifulsoup4 pydantic httpx \
+            chainlit fastapi uvicorn
 setx OPENAI_API_KEY "sk-..."      # PowerShell; reopen the shell afterwards
 ```
 
-Build the corpus (parses archived payloads + agent spreadsheets, then validates —
-one step, so build and validation cannot drift):
+Build the corpus — parse, transform and validate in one step, so build and
+validation cannot drift:
 
 ```bash
 cd src/scraper && python build_corpus.py
 ```
 
-Embed and index into a local Qdrant (incremental; a sqlite vector cache means
-only changed blocks are ever re-embedded):
+Embed and index into a local Qdrant (incremental):
 
 ```bash
 cd src && python -m index.cli build
 ```
 
-Ask it something:
+Then either the web UI:
+
+```bash
+python serve.py
+```
+
+or the terminal:
 
 ```bash
 python -m agent.cli
-```
-
-```bash
 python -m agent.cli -q "Кои се овластените регистрациони агенти во Гостивар?"
-```
-
-Verify the whole stack offline — no API key, no network, no cost:
-
-```bash
-python -m agent.selftest && python -m eval.cli selftest
 ```
 
 ---
@@ -393,111 +285,93 @@ python -m agent.selftest && python -m eval.cli selftest
 ## Repository layout
 
 ```
+app.py                  Chainlit handlers
+serve.py                FastAPI mount + uvicorn  ← the entry point
+ui/                     Presentation only; imports src/, never the reverse
+├── backend.py              singletons, backend thread, agent factory
+├── tracing.py              wrappers that emit Chainlit steps
+└── render.py               Answer → markdown, citations, footer
+
 src/
 ├── scraper/            Acquisition + transform
 │   ├── fetch_services.py      archival fetch with retry
-│   ├── payload_guard.py       rejects WAF pages / truncated JSON before parsing
+│   ├── payload_guard.py       rejects WAF pages / truncated JSON
 │   ├── crm_parser.py          {Columns,Data} decoder, HTML→text, variant merge
 │   ├── agents_parser.py       .xlsx agent lists → municipality blocks
-│   ├── build_corpus.py        single entry point: build + validate
-│   └── validate_corpus.py     strict Pydantic gate, tagged union on scope
+│   └── build_corpus.py        single entry point: build + validate
 │
 ├── index/              Retrieval
 │   ├── embedder.py            OpenAI embeddings, sqlite cache, batching, backoff
 │   ├── qdrant_indexer.py      payload mapping, incremental upsert, manifest
-│   ├── qdrant_retriever.py    dense search + metadata filters
 │   ├── hybrid.py              BM25 ⊕ dense via RRF
 │   ├── aliases.py             vocabulary bridging, fusion-based expansion
-│   ├── intent.py              question → section type
 │   └── structured.py          deterministic section + directory fetch
 │
 ├── eval/               Measurement
-│   ├── corpus.py              typed read-only view + lookup tables
-│   ├── text.py                Macedonian tokenizer / stemmer
-│   ├── metrics.py             graded-relevance ranking metrics
 │   ├── goldset.py             synthetic case generation, gold validation
 │   ├── curated.py             hand-authored cases as self-healing rules
+│   ├── answers.py             answer-level scorers
 │   ├── harness.py             scoring, slicing, regression gate
-│   └── cli.py                 gen · run · report · compare · selftest
+│   └── cli.py                 gen · run · report · compare · answer · selftest
 │
 └── agent/              Answering
     ├── context.py             dedup, coverage audit, ambiguity, citations
     ├── prompts.py             system prompt (EN rules, MK output)
-    ├── agent.py               orchestration, multi-turn clarification
-    └── cli.py                 interactive REPL
+    ├── agent.py               orchestration, tool loop, multi-turn clarification
+    ├── selftest.py            offline gate
+    ├── injection.py           prompt-injection gate
+    └── tools/                 the six live tools
+        ├── __init__.py            REGISTRY + DISPATCH
+        ├── vision.py              shared gpt-4o vision extraction
+        ├── fixtures.py            recorded responses, so gates never hit the portal
+        └── …                      one module per form + resolvers
 ```
 
 ---
 
 ## Evaluation harness
 
-Retriever-agnostic by design — it was built *before* the index, because the index
-is a choice and the measurement is not. Integrating any new retrieval stack is
-one function:
+Retriever-agnostic by design — built *before* the index, because the index is a
+choice and the measurement is not. Integrating a new retrieval stack is one
+function:
 
 ```python
-# src/index/my_retriever.py
 def build(corpus):
     return MyRetriever(corpus)   # .name + .search(query, k) -> [chunk_id | Hit]
 ```
 
 ```bash
-python -m eval.cli run --retriever index.my_retriever:build --tag mine \
-       --baseline eval/reports/structured.json
+python -m eval.cli run --retriever index.my_retriever:build --baseline eval/reports/post-form2.json
 ```
 
 Exits non-zero on any regression beyond tolerance — **overall or per family**.
 Per-family is the point: a change that lifts the easy families while destroying
 `variation_documents` is a net loss the overall mean hides.
 
-Two tiers of gold, deliberately different:
+Two tiers of gold: **synthetic (512)**, generated from the corpus as a
+regression signal rather than a quality measure, and **curated (50)**, real
+phrasing stored as *rules* (service + variant + section type) rather than frozen
+ids, so a corpus rebuild re-resolves them instead of letting them rot.
 
-- **Synthetic (512)** — generated from the corpus, deterministic, full coverage.
-  A regression signal, *not* a quality measure: several families quote corpus
-  text back at the retriever, so absolute scores read high.
-- **Curated (23)** — real phrasing, hand-labelled, stored as *rules* (service +
-  variant + section type) rather than frozen IDs, so a corpus rebuild
-  re-resolves them instead of letting them rot.
-
-The harness has its own known-answer tests. If the oracle retriever does not
-score exactly 1.000, the harness is broken — not the retriever.
+Answer generation and scoring are separate steps — answers are persisted, so
+re-scoring after a rule change costs nothing. Tool calls replay from recorded
+fixtures by default; `--live-tools` hits the real portal.
 
 ---
-
-## Roadmap
-
-### 🚧 Tool calling integration — *in development*
-
-Extending the agent beyond a static corpus to execute dynamic queries and API
-actions against live registry endpoints: subject lookup by ЕМБС, real-time status
-of a submitted application, and current tariff schedules. The retrieval tool
-already has the right shape — `search(query, k, filters)` — so tools slot into
-the same contract rather than requiring a new orchestration model.
-
-### 🚧 Multi-turn and adversarial evaluation — *next*
-
-The answer harness scores single questions. Three paths remain unmeasured, each
-one a place this system has already been bitten or could be:
-
-- **Multi-turn.** The worst defect this project produced — a lawyer assembled
-  from a Струмица name and a Гостивар address — was a *conversation* failure,
-  and is currently untestable: every case is one question.
-- **Partial-coverage answers.** The `<coverage>` warning has no case that
-  triggers it.
-- **Prompt injection through corpus text.** Blocks are portal-authored and get
-  rendered into a system message.
 
 ## Tech stack
 
 | | |
 |---|---|
 | **Language** | Python 3.14 |
-| **Vector store** | Qdrant (embedded local mode; server-ready payload indexes) |
+| **Generation** | OpenAI `gpt-4o`, `temperature=0.0`, native tool calling |
+| **Vision** | `gpt-4o` structured outputs (strict JSON schema) |
 | **Embeddings** | OpenAI `text-embedding-3-small` (1,536-d, cosine) |
-| **Generation** | OpenAI `gpt-4o-mini`, `temperature=0.0` |
+| **Vector store** | Qdrant (embedded local mode; server-ready payload indexes) |
 | **Lexical** | Custom BM25 + Macedonian stemmer — pure stdlib |
 | **Validation** | Pydantic (strict tagged-union corpus schema) |
-| **Ingestion** | BeautifulSoup, openpyxl |
+| **Web** | Chainlit on FastAPI / uvicorn |
+| **HTTP** | httpx |
 | **Evaluation** | Custom harness — pure stdlib, zero test dependencies |
 
 The evaluation harness and lexical retriever carry **no third-party
@@ -507,20 +381,31 @@ dependencies** — they run anywhere Python does, with no API key.
 
 ## Known limitations
 
-Stated plainly, because a system that documents its edges is easier to trust than
-one that claims none.
+Stated plainly, because a system that documents its edges is easier to trust
+than one that claims none.
 
-- **Answer quality is measured on 27 curated cases only.** Broad, but shallow:
-  see the roadmap for the paths still untested.
-- **`gpt-4o-mini` citation discipline** is imperfect — it tends to batch
-  citations at the end of a passage rather than per claim. `--model gpt-4o` is a
-  one-flag swap.
-- **The curated set is small (23).** One case moves a family average
-  noticeably; treat curated deltas as directional until it reaches 50–100.
-- **Some tariffs are published as `0`** by the registry itself. The system reports
-  the row verbatim and declines to interpret it as "free".
-- **Local Qdrant takes an exclusive lock** on the storage directory — the agent,
-  the indexer and the eval harness cannot run concurrently.
+- **Three of the four live services run offline.** Profile, decision and status
+  sit behind reCAPTCHA; those tools read operator-saved documents and say so
+  when they hold nothing. Only `check_entity_size` calls the registry directly.
+- **Local Qdrant takes an exclusive lock.** The UI, the indexer and the eval
+  harness cannot run concurrently, and turns are serialised within the UI.
+- **Vision is the one non-deterministic step.** Mitigated by identifier
+  self-checks, shape checks and a re-read on mismatch — not eliminated. An
+  official data feed would remove it entirely; the source interface is already
+  shaped for that swap.
+- **The curated set is 50 cases.** Broad, not deep. One case moves a family
+  average noticeably.
+- **Some tariffs are published as `0`** by the registry itself. The system
+  reports the row verbatim and declines to interpret it as "free".
+
+---
+
+## What's next
+
+An official open-data API would delete the Vision layer entirely: the tool
+contracts, the agent loop, the citation gate and the eval suite stay as they
+are, and only the source objects behind each tool change. The seams are already
+in place.
 
 ---
 
