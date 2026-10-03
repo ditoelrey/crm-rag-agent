@@ -1,6 +1,6 @@
 # ЦРМ Агент
 
-**A grounded AI agent for the Central Registry of North Macedonia** — answers
+**A grounded AI agent for the Central Registry of Macedonia** — answers
 questions about company registration, annual accounts, pledges, certificates,
 fees and deadlines in Macedonian, with a citation on every factual claim, and
 executes live lookups against the registry's own services.
